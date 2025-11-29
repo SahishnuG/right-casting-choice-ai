@@ -1,27 +1,10 @@
-"""
-Right Casting Choice AI - Streamlit App (simplified)
-
-This simplified version does exactly what you asked:
-- Runs a single `crew.kickoff` to execute the pipeline.
-- Formats and prints the Crew output cleanly in Streamlit.
-- Displays `n_similar` posters (from OMDb tool `Poster` field) in the app UI.
-- Keeps error handling minimal but robust: if Crew or tools fail, prints the fallback outputs.
-- Accepts user budget in CRORE (INR) and converts to INR before passing to the crew.
-
-Usage:
-    pip install streamlit requests pandas numpy crewai-tools google-generativeai python-dotenv
-    setx GEMINI_API_KEY "<your-gemini-key>"  # or setx GOOGLE_API_KEY
-    setx SERPER_API_KEY "<your-serper-key>"
-    setx OMDB_API_KEY "<your-omdb-key>"
-    streamlit run right-casting-choice-ai_streamlit.py
-
-"""
+# app.py (updated: spinner while crew runs + Candidate Pool + Similar Movies tab)
 from __future__ import annotations
 
 import json
 import os
-import time
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import sys
 
@@ -29,255 +12,486 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load .env early and standardize key env vars for LLM/tools
+# Load env & make src importable
 load_dotenv()
-gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-if gemini_key:
-    os.environ["GEMINI_API_KEY"] = gemini_key
-    os.environ.setdefault("GOOGLE_API_KEY", gemini_key)
-serper_key = os.getenv("SERPER_API_KEY") or os.getenv("SERPERDEV_API_KEY") or ""
-if serper_key:
-    os.environ["SERPER_API_KEY"] = serper_key
-omdb_key = os.getenv("OMDB_API_KEY") or ""
-if omdb_key:
-    os.environ["OMDB_API_KEY"] = omdb_key
-
-# Ensure src/ is importable
 sys.path.append(str((Path(__file__).parent / "src").resolve()))
 
-# Crew and tools
+# Crew imports (keep as in your project)
 from right_casting_choice_ai.crew import RightCastingChoiceAi
 from right_casting_choice_ai.tools.omdb import OmdbTool
 
-# Minimal Gemini fallback (used only for local character extraction if needed)
+# Minimal guard for Gemini import (unused here)
 try:
-    import google.generativeai as genai
+    import google.generativeai as genai  # type: ignore
     _HAS_GEMINI = True
 except Exception:
     genai = None
     _HAS_GEMINI = False
 
 
-def convert_crore_to_inr(crore: float) -> int:
-    return int(crore * 10_000_000)
+# -------------------- Utilities --------------------
+def try_extract_json_from_string(s: Optional[str]) -> Optional[Any]:
+    """Attempt to extract JSON object/list from a string (handles ```json fences)."""
+    if s is None:
+        return None
+    txt = s.strip()
+    # remove fenced blocks
+    txt = re.sub(r"^```json\s*", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"^```\s*", "", txt)
+    txt = re.sub(r"```\s*$", "", txt)
+    # try direct
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+    # try find first JSON-like substring
+    m = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', txt)
+    if m:
+        candidate = m.group(1)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            try:
+                return json.loads(candidate.replace("'", '"'))
+            except Exception:
+                return None
+    return None
 
 
 def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Run single crew.kickoff and return a dict (best effort)."""
+    """Run crew.kickoff once and attempt to return a dict. Never raise."""
     try:
         crew = RightCastingChoiceAi().crew()
         result = crew.kickoff(inputs=inputs)
+        # Prefer to_dict
         if hasattr(result, "to_dict"):
-            return result.to_dict()
+            try:
+                d = result.to_dict()
+                if isinstance(d, dict) and d:
+                    return d
+            except Exception:
+                pass
+        # raw attribute
         if hasattr(result, "raw"):
-            return result.raw
+            raw = result.raw
+            # if dict/list return as-is
+            if isinstance(raw, dict):
+                return raw
+            if isinstance(raw, list):
+                return {"raw": raw}
+            if isinstance(raw, str):
+                parsed = try_extract_json_from_string(raw)
+                if parsed is not None:
+                    # if parsed is list/dict return inside {"raw": parsed} so UI knows it's raw-block
+                    return {"raw": parsed, "verbose_raw": raw}
+                return {"raw": raw}
+        # try dict(result)
         try:
-            return dict(result)
+            d = dict(result)
+            if isinstance(d, dict):
+                return d
         except Exception:
-            return {"raw_result": str(result)}
+            pass
+        # fallback: string repr
+        s = str(result)
+        parsed = try_extract_json_from_string(s)
+        if parsed is not None:
+            return {"raw": parsed, "verbose_raw": s}
+        return {"raw": s}
     except Exception as e:
         return {"error": f"Crew kickoff failed: {e}"}
 
 
-st.set_page_config(page_title="Right Casting Choice AI (simple)", layout="wide")
-st.title("🎬 Right Casting Choice AI — Simplified")
+def is_indian_movie(m: Dict[str, Any]) -> bool:
+    """Simple heuristic - used earlier in your app. Keep it minimal here."""
+    if not isinstance(m, dict):
+        return False
+    raw = m.get("_raw") or m.get("raw") or {}
+    if isinstance(raw, dict):
+        lang = (raw.get("Language") or raw.get("language") or "").lower()
+        country = (raw.get("Country") or raw.get("country") or "").lower()
+        if "india" in country or "hindi" in lang:
+            return True
+    title = (m.get("Title") or m.get("title") or "").lower()
+    return any(tok in title for tok in ["raj", "bahubali", "gully", "raazi", "padma", "tanhaji", "drishyam"])
 
+
+def normalize_movie_boxoffice(m: Dict[str, Any], usd_to_inr: float) -> Tuple[Optional[int], Optional[int]]:
+    """Return (box_inr, budget_inr) attempting to read common fields."""
+    def parse_money_str(s):
+        if s is None:
+            return None
+        s = str(s)
+        s = s.strip()
+        if not s or s.upper() == "N/A":
+            return None
+        digits = re.sub(r"[^0-9]", "", s)
+        if not digits:
+            return None
+        try:
+            return int(digits)
+        except Exception:
+            return None
+
+    box_inr = None
+    if isinstance(m.get("BoxOfficeINR"), (int, float)):
+        box_inr = int(m.get("BoxOfficeINR"))
+    elif isinstance(m.get("box_office_inr"), (int, float)):
+        box_inr = int(m.get("box_office_inr"))
+    else:
+        # try BoxOffice or box_office string
+        raw = m.get("BoxOffice") or m.get("box_office")
+        parsed = parse_money_str(raw)
+        if parsed:
+            # assume USD unless Indian movie
+            if is_indian_movie(m):
+                box_inr = parsed
+            else:
+                box_inr = int(parsed * usd_to_inr)
+
+    budget_inr = None
+    if isinstance(m.get("BudgetINR"), (int, float)):
+        budget_inr = int(m.get("BudgetINR"))
+    elif isinstance(m.get("budget_inr"), (int, float)):
+        budget_inr = int(m.get("budget_inr"))
+    else:
+        raw = m.get("Budget") or m.get("budget")
+        parsed = parse_money_str(raw)
+        if parsed:
+            if is_indian_movie(m):
+                budget_inr = parsed
+            else:
+                budget_inr = int(parsed * usd_to_inr)
+    return box_inr, budget_inr
+
+
+# new helpers to robustly read candidate fields
+def get_first(d: Dict[str, Any], keys: List[str], default=None):
+    """Return first non-None value from d for any of keys (supports nested 'raw')."""
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    # check 'raw' nested dict
+    raw = d.get("raw")
+    if isinstance(raw, dict):
+        for k in keys:
+            if k in raw and raw[k] is not None:
+                return raw[k]
+    return default
+
+
+def compute_avg_bo_from_movies(candidate: Dict[str, Any], role_movies: List[Dict[str, Any]], usd_to_inr: float) -> Optional[int]:
+    """If candidate lacks avg box office, try to compute average from role_movies where actor appears."""
+    if not isinstance(role_movies, list):
+        return None
+    total = 0
+    count = 0
+    name = get_first(candidate, ["name", "actor", "title"]) or ""
+    for m in role_movies:
+        if not isinstance(m, dict):
+            continue
+        actors_str = (m.get("Actors") or m.get("actors") or "")
+        try:
+            if name and isinstance(actors_str, str) and name.lower() in actors_str.lower():
+                bo, _ = normalize_movie_boxoffice(m, usd_to_inr)
+                if bo:
+                    total += bo
+                    count += 1
+        except Exception:
+            continue
+    if count == 0:
+        return None
+    return int(total / count)
+
+
+# -------------------- Streamlit UI --------------------
+st.set_page_config(page_title="Right Casting Choice AI — Final", layout="wide")
+st.title("🎬 Right Casting Choice AI — Final")
+
+# Sidebar settings
 with st.sidebar:
     st.header("Settings")
     n_similar = st.number_input("Number of similar movies", min_value=1, max_value=10, value=3)
-    user_budget_crore = st.number_input("User budget (INR crores)", min_value=0.0, value=10.0, step=0.5)
+    user_budget_ui = st.number_input(
+        "User budget (UI units - Cr for Bollywood, M for Hollywood)", min_value=0.0, value=100.0, step=0.5
+    )
     usd_to_inr = float(st.number_input("USD→INR rate", min_value=10.0, max_value=200.0, value=83.0))
-    industry = st.selectbox("Industry", options=["hollywood", "bollywood"], index=0)
+    industry = st.selectbox("Industry", options=["hollywood", "bollywood"], index=1)
 
-plot = st.text_area("Movie plot (<2000 characters)", height=180, value="A righteous and fearless police officer takes on corruption and crime to restore justice in his city.")
+# display units
+if industry == "bollywood":
+    currency_symbol = "₹"
+    unit_label = "Cr"
+    multiplier = 10_000_000
+else:
+    currency_symbol = "$"
+    unit_label = "M"
+    multiplier = 1_000_000
+
+plot = st.text_area("Movie plot", value="A righteous and fearless police officer takes on corruption and crime to restore justice in his city.", height=150)
 run_btn = st.button("Run Crew Flow")
 
-if run_btn:
-    st.info("Running crew.kickoff — this will execute the pipeline once and print results below.")
-    user_budget_inr = convert_crore_to_inr(user_budget_crore)
+if not run_btn:
+    st.info("Fill inputs and click Run Crew Flow to fetch candidates and similar movies.")
+    st.stop()
 
-    inputs = {
-        "plot": plot,
-        "n_similar": int(n_similar),
-        "usd_to_inr": float(usd_to_inr),
-        "user_budget_inr": int(user_budget_inr),
-        "industry": industry,
-    }
+# Build inputs & call crew once
+user_budget_raw = int(user_budget_ui * multiplier)
+inputs = {
+    "plot": plot,
+    "n_similar": int(n_similar),
+    "usd_to_inr": float(usd_to_inr),
+    "user_budget_inr": int(user_budget_raw) if industry == "bollywood" else None,
+    "user_budget_usd": int(user_budget_raw) if industry == "hollywood" else None,
+    "industry": industry,
+}
 
-    # Try to capture richer outputs from Crew when available
+# ------------------ Simple spinner while crew runs ------------------
+st.info("Running crew.kickoff() — one-shot run (may take a few seconds).")
+with st.spinner("Running crew pipeline..."):
     crew_output = safe_crew_kickoff(inputs)
-    print(crew_output)  # Debugging
-    # If empty, inspect common attributes on CrewOutput
-    if isinstance(crew_output, dict) and not crew_output:
-        try:
-            crew = RightCastingChoiceAi().crew()
-            result_obj = crew.kickoff(inputs=inputs)
-            # Try known attributes on CrewOutput to build a dict
-            enriched = {}
-            if hasattr(result_obj, "to_dict"):
-                enriched = result_obj.to_dict() or {}
-            elif hasattr(result_obj, "raw"):
-                enriched = result_obj.raw or {}
-            # tasks_output: list of per-task objects
-            if not enriched and hasattr(result_obj, "tasks_output"):
-                try:
-                    tasks_out = []
-                    for t in getattr(result_obj, "tasks_output", []):
-                        # Try to read common fields
-                        name = getattr(t, "name", None) or getattr(t, "task_name", None)
-                        output = getattr(t, "output", None) or getattr(t, "result", None)
-                        raw_output = getattr(t, "raw_output", None)
-                        tasks_out.append({
-                            "name": name,
-                            "output": output,
-                            "raw_output": raw_output,
-                        })
-                    enriched = {"tasks": tasks_out}
-                except Exception:
-                    pass
-            # Fallback to repr
-            if not enriched:
-                enriched = {"repr": repr(result_obj)}
-            crew_output = enriched
-        except Exception:
-            pass
 
-    st.subheader("Raw Crew Output (JSON)")
-    st.json(crew_output)
-    # Debug keys view to help diagnose structure
-    try:
-        if isinstance(crew_output, dict):
-            st.caption(f"Top-level keys: {list(crew_output.keys())}")
-    except Exception:
-        pass
+# ---------------- Try to find the normalized data the crew returned. ----------------
+def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (roles_list, movies_list)
+    roles_list is a list of role dicts each containing 'role'/'name_hint'/'candidates'/'movies' etc.
+    movies_list is list of movies metadata dicts (with Poster etc).
+    """
+    roles = []
+    movies = []
 
-    # Try to locate the OMDb/Similar movies results and display posters
-    posters: List[str] = []
-
-    # Common places Crew output may store similar movies
-    candidates = []
-    if isinstance(crew_output, dict):
-        # pattern 1: top-level similar_movies_task
-        maybe = crew_output.get("similar_movies_task") or crew_output.get("similar_movies")
-        if isinstance(maybe, list):
-            candidates = maybe
-        else:
-            # pattern 2: tasks list
-            tasks = crew_output.get("tasks") or []
-            if isinstance(tasks, list):
+    # direct top-level
+    if isinstance(crew_out, dict):
+        # Case 1: crew_out already has top-level structure
+        if crew_out.get("raw") and isinstance(crew_out["raw"], list):
+            candidate_block = crew_out["raw"]
+            if candidate_block and isinstance(candidate_block[0], dict) and ("role" in candidate_block[0] or "candidates" in candidate_block[0]):
+                roles = candidate_block
+            else:
+                # search for role-like dicts and movie-like dicts inside the list
+                for v in candidate_block:
+                    if isinstance(v, dict):
+                        if "role" in v or "candidates" in v or "name_hint" in v:
+                            roles.append(v)
+                        if "imdbID" in v or "Title" in v or "title" in v or "Poster" in v:
+                            movies.append(v)
+        elif crew_out.get("raw") and isinstance(crew_out["raw"], str):
+            parsed = try_extract_json_from_string(crew_out["raw"])
+            if isinstance(parsed, list):
+                if parsed and isinstance(parsed[0], dict) and ("role" in parsed[0] or "candidates" in parsed[0]):
+                    roles = parsed
+                else:
+                    for v in parsed:
+                        if isinstance(v, dict):
+                            if "imdbID" in v or "Title" in v or "title" in v:
+                                movies.append(v)
+                            if "role" in v or "candidates" in v:
+                                roles.append(v)
+        # direct top-level keys
+        if not roles:
+            if isinstance(crew_out.get("candidates"), list) and isinstance(crew_out.get("recommended_pool"), list):
+                roles = [{"role": "Lead", "name_hint": "Lead", "candidates": crew_out.get("candidates"), "recommended_pool": crew_out.get("recommended_pool")}]
+            elif isinstance(crew_out.get("recommended_pool"), list) and isinstance(crew_out.get("movies"), list):
+                roles = [{"role": "Lead", "name_hint": "Lead", "candidates": crew_out.get("recommended_pool"), "movies": crew_out.get("movies")}]
+            elif isinstance(crew_out.get("movies"), list):
+                movies = crew_out.get("movies")
+            # check tasks outputs for extract_characters_task or rank_candidates_task
+            tasks = crew_out.get("tasks") or []
+            if isinstance(tasks, list) and tasks:
                 for t in tasks:
-                    if isinstance(t, dict) and t.get("name") in ("similar_movies_task", "similar_movies_and_omdb", "similar_movies"):
-                        out = t.get("output") or t.get("result") or t.get("raw_output")
-                        if isinstance(out, list):
-                            candidates = out
-                            break
-            # pattern 3: results map
-            if not candidates:
-                results_map = crew_output.get("results") or {}
-                maybe = results_map.get("similar_movies_task") or results_map.get("similar_movies")
-                if isinstance(maybe, list):
-                    candidates = maybe
+                    if not isinstance(t, dict):
+                        continue
+                    out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
+                    if isinstance(out, str):
+                        parsed = try_extract_json_from_string(out)
+                        if parsed is not None:
+                            out = parsed
+                    if isinstance(out, list) and out:
+                        if isinstance(out[0], dict) and ("role" in out[0] or "candidates" in out[0] or "name_hint" in out[0]):
+                            roles = out
+                        if isinstance(out[0], dict) and ("imdbID" in out[0] or "Title" in out[0] or "poster" in out[0]):
+                            movies = out
+                    if isinstance(out, dict):
+                        if "candidates" in out and isinstance(out["candidates"], list):
+                            role_name = out.get("role") or out.get("name_hint") or "Lead"
+                            roles.append({"role": role_name, "candidates": out.get("candidates"), "movies": out.get("movies") or []})
+                        if "movies" in out and isinstance(out["movies"], list):
+                            movies = out.get("movies")
+    return roles, movies
 
-    # If still empty, attempt to harvest any list of dicts with Title/Poster fields
-    if not candidates:
-        # search recursively for movie-like lists
-        def find_movie_lists(obj):
-            found = []
-            if isinstance(obj, list):
-                # check if list elements are dicts with Title
-                if all(isinstance(i, dict) and ("Title" in i or "Poster" in i) for i in obj):
+
+roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
+
+# If roles_list is empty, do a last-ditch recursive search for anything that looks like candidate lists
+if not roles_list:
+    def find_roles_recursive(obj):
+        if isinstance(obj, list):
+            if obj and isinstance(obj[0], dict):
+                sample = obj[0]
+                if ("name" in sample and ("score" in sample or "movies" in sample)) or ("role" in sample and "candidates" in sample):
                     return obj
-                for item in obj:
-                    res = find_movie_lists(item)
-                    if res:
-                        return res
-            elif isinstance(obj, dict):
-                for v in obj.values():
-                    res = find_movie_lists(v)
-                    if res:
-                        return res
-            return None
-
-        maybe = find_movie_lists(crew_output)
-        if maybe:
-            candidates = maybe
-
-    # If bollywood, filter candidates/movies heuristically for Indian context
-    if industry == "bollywood":
-        filtered = []
-        for item in candidates:
-            if isinstance(item, dict):
-                raw = item.get("_raw") or {}
-                lang = (raw.get("Language") or "").lower()
-                country = (raw.get("Country") or "").lower()
-                if ("india" in country) or ("hindi" in lang):
-                    filtered.append(item)
-        if filtered:
-            candidates = filtered
-
-    # Collect poster URLs up to n_similar
-    for item in candidates:
-        if isinstance(item, dict):
-            poster = item.get("Poster") or item.get("poster") or item.get("PosterUrl")
-            if poster:
-                posters.append(poster)
-        if len(posters) >= n_similar:
-            break
-
-    # Display posters
-    st.subheader(f"Top {n_similar} Posters from OMDb results")
-    if posters:
-        cols = st.columns(min(len(posters), n_similar))
-        for idx, url in enumerate(posters[:n_similar]):
-            c = cols[idx % len(cols)]
-            with c:
-                st.image(url, use_column_width=True)
-    else:
-        st.info("No posters found in Crew output. Ensure OMDb tool returned 'Poster' links in its output.")
-
-    # Additionally, format and print actor ranking if available
-    st.subheader("Actor Candidates / Rankings (if present)")
-    ranking = None
-    if isinstance(crew_output, dict):
-        ranking = crew_output.get("rank_candidates_task") or crew_output.get("rank_candidates") or crew_output.get("ranking")
-        if not ranking:
-            tasks = crew_output.get("tasks") or []
-            for t in tasks:
-                if isinstance(t, dict) and t.get("name") in ("rank_candidates_task", "rank_candidates", "budget_ranker"):
-                    ranking = t.get("output") or t.get("result") or t.get("raw_output")
-                    break
-
-    if isinstance(ranking, dict):
-        candidates = ranking.get("candidates") or ranking.get("candidates_list") or ranking.get("rows")
-        if isinstance(candidates, list):
-            df = pd.DataFrame(candidates)
-            st.dataframe(df)
-            # Build per-role candidate lists
-            st.subheader("Suggested Actors per Role")
-            # Characters may come from crew output; try multiple locations
-            characters: List[Dict[str, Any]] = []
-            if isinstance(crew_output, dict):
-                characters = crew_output.get("extract_characters_task") or crew_output.get("characters") or []
-                if not isinstance(characters, list):
-                    characters = []
-            # If characters empty, create a single generic role
-            if not characters:
-                characters = [{"role": "Lead", "traits": ["heroic", "fearless"], "age_range": "25-45"}]
-            # Use top-N actors as suggestions per role (simple heuristic)
-            top_names: List[str] = []
-            # candidates items may be dicts with 'name' field
-            for row in candidates:
-                name = row.get("name") or row.get("actor")
-                if name:
-                    top_names.append(name)
-            top_names = top_names[:6] if top_names else []
-            for ch in characters:
-                role = ch.get("role") or "Role"
-                st.markdown(f"**{role}**")
-                st.write(", ".join(top_names) if top_names else "No candidates found")
+            for item in obj:
+                res = find_roles_recursive(item)
+                if res:
+                    return res
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                res = find_roles_recursive(v)
+                if res:
+                    return res
+        return None
+    maybe = find_roles_recursive(crew_output)
+    if maybe:
+        if isinstance(maybe, list) and maybe and isinstance(maybe[0], dict) and "name" in maybe[0]:
+            roles_list = [{"role": "Lead", "name_hint": "Lead", "candidates": maybe, "movies": movies_list}]
         else:
-            st.write(ranking)
-    else:
-        st.info("No actor ranking found in Crew output.")
+            roles_list = []
 
-    st.success("Crew run complete. See above for results.")
+# Normalize movies_list: if movies_list is empty but roles_list have 'movies' use them
+if not movies_list and roles_list:
+    collected = []
+    for r in roles_list:
+        for m in (r.get("movies") or []):
+            if isinstance(m, dict):
+                collected.append(m)
+    movies_list = collected
+
+# Create tabs: Candidate Pool and Similar Movies (as requested)
+tab_candidates, tab_movies = st.tabs(["📋 Candidate Pool", "🎞 Similar Movies & Posters"])
+
+# ----------------------- Candidate Pool Tab -----------------------
+with tab_candidates:
+    st.header(f"Audition List ({industry.capitalize()})")
+    if not roles_list:
+        st.info("No role/candidate data could be found in crew output. Check crew logs or task outputs.")
+    else:
+        # show all roles as expanders like your screenshot
+        for role_block in roles_list:
+            role_name = role_block.get("role") or role_block.get("name_hint") or "Role"
+            age_hint = role_block.get("age_range") or role_block.get("estimated_age_at_peak_performance_for_role") or ""
+            gender = role_block.get("gender") or ""
+            traits = role_block.get("traits") or role_block.get("notes") or []
+            # build descriptive header
+            header = f"Role: {role_name}"
+            if age_hint:
+                header += f" ({age_hint})"
+            if gender:
+                header += f" — {gender.capitalize()}"
+            with st.expander(header, expanded=False):
+                if traits:
+                    # traits might be list or string
+                    if isinstance(traits, list):
+                        st.write(f"**Traits:** {', '.join(map(str, traits))}")
+                    else:
+                        st.write(f"**Traits / Notes:** {str(traits)}")
+                candidates = role_block.get("candidates") or role_block.get("recommended_pool") or []
+                role_movies = role_block.get("movies") or movies_list or []
+
+                if not candidates:
+                    st.write("No actors found for this role.")
+                    continue
+
+                # Build display table
+                rows = []
+                for c in candidates:
+                    # candidate object formats vary; try to extract sensible fields
+                    name = get_first(c, ["name", "actor", "title"]) or "Unknown"
+                    gender_val = get_first(c, ["gender", "sex"]) or ""
+                    age_range = get_first(c, ["estimated_age_at_peak_performance_for_role", "age_range"]) or ""
+                    avg_imdb = get_first(c, ["average_imdb_rating", "average_imdb", "avg_imdb", "imdb_rating", "avg_imdb_rating", "score"])
+                    # try to make float
+                    avg_imdb_f = None
+                    try:
+                        if avg_imdb is not None:
+                            avg_imdb_f = float(avg_imdb)
+                            # some crews normalize to 0..1; if avg_imdb <=1 and >0 assume scaled and convert to 10-scale
+                            if 0 < avg_imdb_f <= 1.0:
+                                avg_imdb_f = avg_imdb_f * 10.0
+                    except Exception:
+                        avg_imdb_f = None
+
+                    avg_bo = get_first(c, ["average_box_office_inr", "avg_box_office_inr", "average_box_office", "avg_box_office", "average_box_office_usd"])
+                    # If avg_bo missing, try compute from role_movies
+                    if avg_bo is None:
+                        avg_bo = compute_avg_bo_from_movies(c, role_movies, usd_to_inr)
+
+                    score = get_first(c, ["score", "combined_score", "raw_score"])
+                    notes = get_first(c, ["notes", "note", "notes_summary"]) or ""
+
+                    # Convert INR -> UI display units if possible
+                    bo_display = ""
+                    if isinstance(avg_bo, (int, float)):
+                        bo_display = f"{currency_symbol}{(avg_bo / multiplier):,.2f} {unit_label}"
+
+                    rows.append({
+                        "Actor Name": name,
+                        "Gender": gender_val,
+                        "Est. Age": age_range,
+                        f"Avg. BO ({unit_label})": bo_display,
+                        "Avg. IMDB": (f"{avg_imdb_f:.1f}" if avg_imdb_f is not None else ""),
+                        "Score": (f"{float(score):.4f}" if score is not None else ""),
+                        "Notes": notes
+                    })
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True)
+
+# ----------------------- Similar Movies Tab -----------------------
+with tab_movies:
+    st.header("Similar Movies & Posters")
+    if not movies_list:
+        st.info("No similar movies were returned by the crew.")
+    else:
+        # Show posters in a row up to n_similar
+        posters = []
+        rows = []
+        for m in movies_list:
+            if not isinstance(m, dict):
+                continue
+            poster = m.get("Poster") or m.get("poster") or m.get("poster_url") or ""
+            title = m.get("Title") or m.get("title") or m.get("name") or ""
+            year = m.get("Year") or m.get("year") or ""
+            imdb = m.get("imdbRating") or m.get("imdb_rating") or ""
+            # inside Similar Movies tab
+            box_inr, budget_inr = normalize_movie_boxoffice(m, usd_to_inr)
+            box_usd = int(box_inr / usd_to_inr) if box_inr else None
+            budget_usd = int(budget_inr / usd_to_inr) if budget_inr else None
+
+            rows.append({
+                "Title": title,
+                "Year": year,
+                "IMDB": imdb,
+                "BoxOffice (INR)" if industry=="bollywood" else "BoxOffice (USD)":
+                    box_inr if industry=="bollywood" else box_usd
+            })
+
+            if poster:
+                posters.append({"poster": poster, "title": title})
+            if len(posters) >= n_similar:
+                # keep only n_similar posters
+                posters = posters[:n_similar]
+                break
+
+        # posters row
+        if posters:
+            cols = st.columns(min(len(posters), n_similar))
+            for i, p in enumerate(posters[:n_similar]):
+                with cols[i]:
+                    st.image(p["poster"], use_column_width=True)
+                    st.caption(p["title"])
+
+        # movie table
+        try:
+            df_movies = pd.DataFrame(rows)
+            st.dataframe(df_movies, use_container_width=True)
+        except Exception:
+            st.write(rows)
+
+# Present raw JSON and top-level keys for debugging
+st.subheader("Raw Crew Output (parsed)")
+st.json(crew_output)
+if isinstance(crew_output, dict):
+    st.caption(f"Top-level keys: {list(crew_output.keys())}")
+st.success("Done — candidate pool and similar movies displayed.")
