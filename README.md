@@ -1,54 +1,65 @@
-# RightCastingChoiceAi Crew
+# Right Casting Choice AI
 
-Welcome to the RightCastingChoiceAi Crew project, powered by [crewAI](https://crewai.com). This template is designed to help you set up a multi-agent AI system with ease, leveraging the powerful and flexible framework provided by crewAI. Our goal is to enable your agents to collaborate effectively on complex tasks, maximizing their collective intelligence and capabilities.
+Three-agent casting workflow built on [crewAI](https://crewai.com) with:
+- Character extraction (Gemini LLM)
+- Similar movies via Serper, enriched by OMDb (INR conversions)
+- Budget-aware actor ranking and per-role suggestions
 
-## Installation
+Exclusively uses Gemini; no OpenAI calls. Environment variables are loaded from `.env`.
 
-Ensure you have Python >=3.10 <3.14 installed on your system. This project uses [UV](https://docs.astral.sh/uv/) for dependency management and package handling, offering a seamless setup and execution experience.
+## Requirements
+- Python `>=3.10,<3.14`
+- Dependencies via `pyproject.toml` (includes `crewai[tools]`, `requests`, `streamlit`, `pandas`, `numpy`, `python-dotenv`, `google-generativeai`)
 
-First, if you haven't already, install uv:
-
-```bash
-pip install uv
+## Setup
+1) Create a `.env` in the project root with:
+```
+GEMINI_API_KEY=your_gemini_key   # or GOOGLE_API_KEY
+SERPER_API_KEY=your_serper_key   # or SERPERDEV_API_KEY
+OMDB_API_KEY=your_omdb_key
+USD_TO_INR_RATE=83.0             # optional override
+```
+2) Install dependencies:
+```powershell
+pip install -e .
 ```
 
-Next, navigate to your project directory and install the dependencies:
-
-(Optional) Lock the dependencies and install them by using the CLI command:
-```bash
-crewai install
+## Run (Streamlit UI)
+```powershell
+streamlit run app.py
 ```
-### Customizing
+- Enter the plot, choose `Industry` (Hollywood or Bollywood), set `n_similar`, budget (in crores), and USD→INR.
+- The UI shows:
+	- Raw crew output (for debugging)
+	- Posters from OMDb
+	- Ranked actor candidates
+	- Suggested actors per role (built from top-ranked names; if characters are unavailable, a default role is used)
 
-**Add your `OPENAI_API_KEY` into the `.env` file**
-
-- Modify `src/right_casting_choice_ai/config/agents.yaml` to define your agents
-- Modify `src/right_casting_choice_ai/config/tasks.yaml` to define your tasks
-- Modify `src/right_casting_choice_ai/crew.py` to add your own logic, tools and specific args
-- Modify `src/right_casting_choice_ai/main.py` to add custom inputs for your agents and tasks
-
-## Running the Project
-
-To kickstart your crew of AI agents and begin task execution, run this from the root folder of your project:
-
-```bash
-$ crewai run
+## Run (CLI sample)
+```powershell
+python main.py
 ```
+Outputs:
+- Summary counts (characters, similar movies, candidates)
+- Suggested actors per role
+- Full JSON (normalized) result
 
-This command initializes the right-casting-choice-ai Crew, assembling the agents and assigning them tasks as defined in your configuration.
+## Industry behavior
+- `Hollywood`: default, all actors/movies considered
+- `Bollywood`: filters similar-movie candidates to Indian context using OMDb `_raw.Language` (Hindi) and `_raw.Country` (India)
 
-This example, unmodified, will run the create a `report.md` file with the output of a research on LLMs in the root folder.
+## Project Structure
+- `src/right_casting_choice_ai/crew.py`: defines the three agents and tasks, attaches Serper + OMDb tools, sets Gemini model.
+- `src/right_casting_choice_ai/config/agents.yaml`: agent configs.
+- `src/right_casting_choice_ai/config/tasks.yaml`: task prompts/outputs.
+- `src/right_casting_choice_ai/tools/omdb.py`: OMDb tool with INR conversion.
+- `app.py`: Streamlit UI orchestrating the crew output.
+- `main.py`: CLI runner printing summary and normalized JSON.
 
-## Understanding Your Crew
+## Troubleshooting
+- Gemini auth errors (INVALID_ARGUMENT): ensure `.env` keys load; the app maps `GOOGLE_API_KEY` → `GEMINI_API_KEY` for SDK/LiteLLM.
+- Empty crew output in UI: the app normalizes different `CrewOutput` shapes (`to_dict`, `raw`, `results`, `tasks_output`). Use the “Top-level keys” caption to guide parsing; rerun with valid keys.
+- Posters missing: check OMDb responses include `Poster` URLs and keys are valid.
 
-The right-casting-choice-ai Crew is composed of multiple AI agents, each with unique roles, goals, and tools. These agents collaborate on a series of tasks, defined in `config/tasks.yaml`, leveraging their collective skills to achieve complex objectives. The `config/agents.yaml` file outlines the capabilities and configurations of each agent in your crew.
-
-## Support
-
-For support, questions, or feedback regarding the RightCastingChoiceAi Crew or crewAI.
-- Visit our [documentation](https://docs.crewai.com)
-- Reach out to us through our [GitHub repository](https://github.com/joaomdmoura/crewai)
-- [Join our Discord](https://discord.com/invite/X4JWnZnxPb)
-- [Chat with our docs](https://chatg.pt/DWjSBZn)
-
-Let's create wonders together with the power and simplicity of crewAI.
+## License
+This project is intended for learning and experimentation. No license is provided by default.
