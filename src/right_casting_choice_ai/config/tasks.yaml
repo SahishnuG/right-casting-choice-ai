@@ -1,0 +1,27 @@
+extract_characters_task:
+  description: >
+    Given the user plot string "{plot}", extract key characters and their
+    characteristics (role, name_hint, age_range, traits). Return JSON array only.
+  expected_output: >
+    A JSON array like:
+    [
+      {"role":"Lead Male","name_hint":"Protagonist","age_range":"30-40","traits":["brave","conflicted"]}
+    ]
+  agent: character_extractor
+
+similar_movies_task:
+  description: >
+    Using the plot "{plot}" and n_similar={n_similar}, run Serper to find
+    similar movie titles and fetch OMDb metadata for each with INR conversion
+    using USD→INR={usd_to_inr}. Return a list of movie dicts.
+  expected_output: >
+    A list of dicts: {Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID}
+  agent: similar_movies_and_omdb
+
+rank_candidates_task:
+  description: >
+    Aggregate actors from the OMDb results and compute scores given user_budget_inr={user_budget_inr}.
+    Return sorted candidates, a recommended_pool (top 6), and per-movie metadata.
+  expected_output: >
+    {"candidates": [...], "recommended_pool": [...], "movies": [...]} JSON object
+  agent: budget_ranker

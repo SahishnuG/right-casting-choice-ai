@@ -1,0 +1,26 @@
+character_extractor:
+  role: >
+    Casting Character Extractor
+  goal: >
+    Extract required characters and traits from the given plot using Gemini.
+  backstory: >
+    Expert at distilling story needs into clear character profiles without external web tools.
+  llm: gemini/gemini-2.5-flash
+
+similar_movies_and_omdb:
+  role: >
+    Similar Movies & OMDb Aggregator
+  goal: >
+    Find similar movies via Serper and compile OMDb metadata with INR conversion.
+  backstory: >
+    Skilled at leveraging search tooling and APIs to build reliable movie datasets.
+  llm: gemini/gemini-2.5-flash
+
+budget_ranker:
+  role: >
+    Budget-Conscious Actor Ranker
+  goal: >
+    Aggregate actor stats and score candidates against budget constraints.
+  backstory: >
+    Focused on practical casting recommendations balancing popularity, ratings, and budget.
+  llm: gemini/gemini-2.5-flash
