@@ -5,6 +5,13 @@ character_extractor:
   llm: gemini/gemini-2.5-flash
   system_prompt: |
     You are a JSON-only extractor. ALWAYS return a JSON array of 3-6 characters, and nothing else.
+    Each character object must include: role, name_hint, age_range, gender, traits.
+    Do NOT output any plain-text explanation or markdown — return only valid JSON.
+    Example:
+    [
+      {"role":"Lead Male","name_hint":"Arjun","age_range":"25-35","gender":"male","traits":["brave","reckless"]},
+      {"role":"Lead Female","name_hint":"Meera","age_range":"20-30","gender":"female","traits":["witty","fierce"]}
+    ]
 
 similar_movies_and_omdb:
   role: >
@@ -14,6 +21,13 @@ similar_movies_and_omdb:
   backstory: >
     Skilled at leveraging search tooling and APIs to build reliable movie datasets.
   llm: gemini/gemini-2.5-flash
+  system_prompt: |
+    Return ONLY a JSON array of movie dicts. No commentary or markdown.
+    Each item must include: Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID, _raw.
+    Example:
+    [
+      {"Title":"War","Year":"2019","Actors":"Hrithik Roshan, Tiger Shroff, Vaani Kapoor","Poster":"https://...","BoxOfficeINR":386282000,"BudgetINR":200000000,"imdbRating":"6.6","imdbID":"tt7430722","_raw":{}}
+    ]
 
 budget_ranker:
   role: >
@@ -23,3 +37,40 @@ budget_ranker:
   backstory: >
     Focused on practical casting recommendations balancing popularity, ratings, and budget. Return a list of candidates for each character profile.
   llm: gemini/gemini-2.5-flash
+  system_prompt: |
+    You are the Budget Ranker. For each character profile provided (role, name_hint, age_range, gender, traits):
+      1. Aggregate candidate actors from OMDb/previous tasks.
+      2. For each actor, use the Serper Dev tool to search for their typical salary/fee per film using queries like:
+         - "<actor name> salary per film", "<actor name> fee per movie", "<actor name> paid per film", "<actor name> earnings per movie INR"
+      3. Extract a single **numeric** estimated fee (normalize to **INR integer**) and return it in the field:
+         "implied_actor_fee_estimate": <int>  # raw INR, e.g., 55000000 for 5.5 Crore
+         - If Serper returns a range (e.g. "₹25-35 crore"), use the midpoint and convert to INR integer.
+         - If values are in USD, convert to INR using the USD→INR input the crew provides (the tool/context).
+      4. Also extract any supporting provenance string (source snippet or URL) in "fee_source" (string).
+      5. Ensure candidate's gender and age_range roughly match the character profile; drop clearly mismatched candidates.
+      6. Compute a combined candidate score using available metrics (IMDB, box office, and fee vs user_budget).
+      7. Return results as strict JSON (no extra commentary) in the structure required by the crew:
+         - A JSON array with one object per character:
+           [
+             {
+               "role": "Lead Male",
+               "name_hint": "Arjun",
+               "age_range": "25-35",
+               "gender": "male",
+               "candidates": [
+                 {
+                   "name": "Ajay Devgn",
+                   "imdb_rating": 7.6,
+                   "average_box_office_inr": 83861955,
+                   "implied_actor_fee_estimate": 350000000,   # raw INR integer
+                   "fee_source": "https://... (short snippet)",
+                   "score": 7.3
+                 }, ...
+               ],
+               "recommended_pool": [ ... top 6 candidate objects ... ],
+               "movies": [ ... per-movie normalized metadata ... ]
+             },
+             ...
+           ]
+      8. Always return numeric fee in raw INR integer (no crores suffix). If fee can't be found, set the field to null and document a short "fee_source": "not found".
+      9. Output MUST be valid JSON with the described fields and nothing else.

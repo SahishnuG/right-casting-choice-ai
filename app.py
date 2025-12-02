@@ -1,4 +1,4 @@
-# app.py (robust parsing + candidate stats from movies)
+# app.py — robust parsing + fees + USD->INR boxoffice parsing + improved UI
 from __future__ import annotations
 
 import json
@@ -7,57 +7,148 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import sys
+import time
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load env & make src importable
+# ---- env & import path ----
 load_dotenv()
 sys.path.append(str((Path(__file__).parent / "src").resolve()))
 
-# Project imports
+# project imports (keep as in your repo)
 from right_casting_choice_ai.crew import RightCastingChoiceAi
 from right_casting_choice_ai.tools.omdb import OmdbTool
 
-# Minimal Gemini guard (unused)
-try:
-    import google.generativeai as genai  # type: ignore
-    _HAS_GEMINI = True
-except Exception:
-    genai = None
-    _HAS_GEMINI = False
-
-
-# -------------------- Utilities --------------------
+# ---- helpers ----
 def try_extract_json_from_string(s: Optional[str]) -> Optional[Any]:
+    """
+    Robustly extract JSON payload from messy LLM output strings.
+    Strategy:
+    1) Remove all code fences (```json ... ``` or ``` ... ``` anywhere in text).
+    2) Try full-string json.loads.
+    3) Try last fenced JSON block if present (```json ... ```), then parse.
+    4) Scan for JSON arrays across the text (prefer last successful parse), then objects.
+    5) Retry with single-quote to double-quote replacement for candidates.
+    """
     if s is None:
         return None
-    txt = str(s).strip()
-    txt = re.sub(r"^```json\s*", "", txt, flags=re.IGNORECASE)
-    txt = re.sub(r"^```\s*", "", txt)
-    txt = re.sub(r"```\s*$", "", txt)
-    try:
-        return json.loads(txt)
-    except Exception:
-        pass
-    m = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', txt)
-    if m:
-        candidate = m.group(1)
+    text = str(s)
+    # If there are code-fenced blocks, try the last fenced block first
+    fenced_blocks = re.findall(r"```json\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if not fenced_blocks:
+        fenced_blocks = re.findall(r"```\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if fenced_blocks:
+        last_block = fenced_blocks[-1].strip()
+        for candidate in (last_block, last_block.replace("'", '"')):
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+    # Remove all fences globally and try whole string
+    cleaned = re.sub(r"```json|```", "", text, flags=re.IGNORECASE).strip()
+    for candidate in (cleaned, cleaned.replace("'", '"')):
         try:
             return json.loads(candidate)
         except Exception:
+            pass
+    # Find all JSON arrays, prefer the last successful parse
+    arrays = list(re.finditer(r"\[[\s\S]*?\]", cleaned))
+    for m in reversed(arrays):
+        cand = m.group(0)
+        for candidate in (cand, cand.replace("'", '"')):
             try:
-                return json.loads(candidate.replace("'", '"'))
+                parsed = json.loads(candidate)
+                return parsed
             except Exception:
-                return None
+                pass
+    # Then find JSON objects
+    objects = list(re.finditer(r"\{[\s\S]*?\}", cleaned))
+    for m in reversed(objects):
+        cand = m.group(0)
+        for candidate in (cand, cand.replace("'", '"')):
+            try:
+                parsed = json.loads(candidate)
+                return parsed
+            except Exception:
+                pass
     return None
 
+def extract_name_hints_from_plot(plot_text: str) -> List[str]:
+    """
+    Heuristic extraction of character names/handles from plot text to nudge the agents.
+    Captures multiword titles (e.g., 'Baron Zog', 'Commander Tane', 'Agent 99', 'The Weaver', 'Unit X-5')
+    and distinctive single tokens inferred from capitalization patterns. No hardcoded names.
+    """
+    if not plot_text:
+        return []
+    txt = plot_text.strip()
+    candidates: List[str] = []
+    seen = set()
+    # Multiword with titles
+    title_patterns = [
+        r"\bBaron\s+[A-Z][\w-]+\b",
+        r"\bCommander\s+[A-Z][\w-]+\b",
+        r"\bAgent\s+\d+[A-Za-z-]*\b|\bAgent\s+[A-Z][\w-]+\b",
+        r"\bThe\s+[A-Z][\w-]+\b",
+        r"\bUnit\s+[A-Z0-9-]+\b",
+    ]
+    for pat in title_patterns:
+        for m in re.finditer(pat, txt):
+            name = m.group(0)
+            if name not in seen:
+                candidates.append(name)
+                seen.add(name)
+    # Distinctive single tokens (capitalized words not at sentence start; allow hyphen digits)
+    banned = {
+        # places / organizations / generic words
+        "Neo", "Veridia", "Neo-Veridia", "Synthetic", "Alliance", "Bio-Lords", "Gilded", "Spire",
+        "Chronos", "Gem", "Sector", "Resistance", "Peace", "Market", "Moons", "Rooftops",
+        "Security", "Grid", "Apocalypse", "Black",
+        # noise tokens often captured by regex
+        "In", "They", "Unknown", "Meanwhile", "As", "Who", "Inside", "Living", "Coming",
+        "Leader", "Fanatical", "Shapeshifting", "Corporate", "Spy", "Head", "Ancient", "Mystic",
+        "Sewers", "Catalyst", "Digital", "Vault", "Key", "Two"
+    }
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9-]+)\b", txt):
+        token = m.group(1)
+        # rudimentary filter: ignore at sentence starts followed by lowercase words that are common nouns
+        if token in banned or token in {"Baron", "Commander", "Agent", "The", "Unit"}:
+            continue
+        if token.upper() == token and len(token) <= 2:
+            continue
+        # prefer uncommon-looking names
+        if token and token[0].isupper() and token.lower() not in {t.lower() for t in banned}:
+            # skip duplicates and words already part of a multiword match
+            if any(token in mw for mw in candidates):
+                continue
+            if token not in seen:
+                candidates.append(token)
+                seen.add(token)
+    # keep top 20 unique hints
+    return candidates[:20]
 
 def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
     try:
         crew = RightCastingChoiceAi().crew()
-        result = crew.kickoff(inputs=inputs)
+        # Simple retry for rate limits
+        retries = 3
+        delay_sec = 4
+        result = None
+        for attempt in range(retries):
+            try:
+                result = crew.kickoff(inputs=inputs)
+                break
+            except Exception as e:
+                msg = str(e)
+                if "RESOURCE_EXHAUSTED" in msg or "RateLimit" in msg or "quota" in msg.lower():
+                    if attempt < retries - 1:
+                        time.sleep(delay_sec)
+                        continue
+                # if not rate limit or out of retries, raise
+                raise
+        # prefer to_dict
         if hasattr(result, "to_dict"):
             try:
                 d = result.to_dict()
@@ -65,6 +156,7 @@ def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
                     return d
             except Exception:
                 pass
+        # raw attr
         if hasattr(result, "raw"):
             raw = result.raw
             if isinstance(raw, dict):
@@ -74,6 +166,7 @@ def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(raw, str):
                 parsed = try_extract_json_from_string(raw)
                 return {"raw": parsed} if parsed is not None else {"raw": raw}
+        # dict(result)
         try:
             d = dict(result)
             if isinstance(d, dict):
@@ -84,68 +177,9 @@ def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
         parsed = try_extract_json_from_string(s)
         if parsed is not None:
             return {"raw": parsed}
-        return {"raw": s}
+        return {"raw": str(result)}
     except Exception as e:
         return {"error": f"Crew kickoff failed: {e}"}
-
-
-def is_indian_movie(m: Dict[str, Any]) -> bool:
-    if not isinstance(m, dict):
-        return False
-    raw = m.get("_raw") or m.get("raw") or {}
-    if isinstance(raw, dict):
-        lang = (raw.get("Language") or raw.get("language") or "").lower()
-        country = (raw.get("Country") or raw.get("country") or "").lower()
-        if "india" in country or "hindi" in lang:
-            return True
-    title = (m.get("Title") or m.get("title") or "").lower()
-    return any(tok in title for tok in ["raj", "bahubali", "gully", "raazi", "padma", "tanhaji", "drishyam"])
-
-
-def normalize_movie_boxoffice(m: Dict[str, Any], usd_to_inr: float) -> Tuple[Optional[int], Optional[int]]:
-    def parse_money_str(s):
-        if s is None:
-            return None
-        s = str(s).strip()
-        if not s or s.upper() == "N/A":
-            return None
-        digits = re.sub(r"[^0-9]", "", s)
-        if not digits:
-            return None
-        try:
-            return int(digits)
-        except Exception:
-            return None
-
-    box_inr = None
-    if isinstance(m.get("BoxOfficeINR"), (int, float)):
-        box_inr = int(m.get("BoxOfficeINR"))
-    elif isinstance(m.get("box_office_inr"), (int, float)):
-        box_inr = int(m.get("box_office_inr"))
-    else:
-        raw = m.get("BoxOffice") or m.get("box_office") or m.get("BoxOfficeUSD") or m.get("boxOffice")
-        parsed = parse_money_str(raw)
-        if parsed:
-            if is_indian_movie(m):
-                box_inr = parsed
-            else:
-                box_inr = int(parsed * usd_to_inr)
-
-    budget_inr = None
-    if isinstance(m.get("BudgetINR"), (int, float)):
-        budget_inr = int(m.get("BudgetINR"))
-    elif isinstance(m.get("budget_inr"), (int, float)):
-        budget_inr = int(m.get("budget_inr"))
-    else:
-        raw = m.get("Budget") or m.get("budget")
-        parsed = parse_money_str(raw)
-        if parsed:
-            if is_indian_movie(m):
-                budget_inr = parsed
-            else:
-                budget_inr = int(parsed * usd_to_inr)
-    return box_inr, budget_inr
-
 
 def pick_first(obj: Dict[str, Any], keys: List[str], default=None):
     for k in keys:
@@ -154,63 +188,199 @@ def pick_first(obj: Dict[str, Any], keys: List[str], default=None):
             return v
     return default
 
+def parse_money_str_to_int(s: Optional[str], usd_to_inr: float = 83.0) -> Optional[int]:
+    """
+    Parse strings like "$5,102,129" or "₹12,345,678" or "12,345,678" -> integer INR.
+    If string contains $ assume USD and convert to INR using usd_to_inr.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s or s.upper() == "N/A":
+        return None
+    # detect USD symbol
+    is_usd = bool(re.search(r"^\s*\$", s) or re.search(r"\$[0-9,]", s))
+    digits = re.sub(r"[^\d]", "", s)
+    if not digits:
+        return None
+    try:
+        val = int(digits)
+        if is_usd:
+            return int(val * usd_to_inr)
+        # if ₹ or no currency assume INR
+        return int(val)
+    except Exception:
+        return None
+
+def normalize_movie_boxoffice(m: Dict[str, Any], usd_to_inr: float) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Return (box_inr, budget_inr) trying:
+      - BoxOfficeINR / BudgetINR fields (numeric)
+      - BoxOffice / Budget strings parsed (USD->INR or INR)
+      - _raw.BoxOffice if present
+    """
+    # box
+    box = None
+    for key in ("BoxOfficeINR", "box_office_inr", "box_inr"):
+        v = m.get(key)
+        if isinstance(v, (int, float)):
+            box = int(v)
+            break
+    if box is None:
+        candidates = [m.get("BoxOffice"), m.get("box_office"), pick_first(m.get("_raw") or {}, ["BoxOffice", "box_office"], None)]
+        for s in candidates:
+            if s:
+                parsed = parse_money_str_to_int(s, usd_to_inr)
+                if parsed:
+                    box = parsed
+                    break
+    # budget
+    budget = None
+    for key in ("BudgetINR", "budget_inr", "budget"):
+        v = m.get(key)
+        if isinstance(v, (int, float)):
+            budget = int(v)
+            break
+    if budget is None:
+        candidates = [m.get("Budget"), pick_first(m.get("_raw") or {}, ["Budget", "budget"], None)]
+        for s in candidates:
+            if s:
+                parsed = parse_money_str_to_int(s, usd_to_inr)
+                if parsed:
+                    budget = parsed
+                    break
+    return box, budget
+
+def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    roles: List[Dict[str, Any]] = []
+    movies: List[Dict[str, Any]] = []
+
+    if not isinstance(crew_out, dict):
+        return roles, movies
+
+    raw = crew_out.get("raw")
+    # common shapes:
+    if isinstance(raw, list):
+        # raw is likely the top-level role list (each item has role/candidates/movies)
+        if raw and isinstance(raw[0], dict) and ("role" in raw[0] or "candidates" in raw[0] or "name_hint" in raw[0]):
+            roles = raw
+        else:
+            # try to find role-like entries and movie-like entries
+            for v in raw:
+                if isinstance(v, dict):
+                    if "role" in v or "candidates" in v or "name_hint" in v:
+                        roles.append(v)
+                    if "imdbID" in v or "Title" in v or "Poster" in v:
+                        movies.append(v)
+    elif isinstance(raw, dict):
+        # raw is dict — it may contain movies/candidates keys
+        if isinstance(raw.get("movies"), list):
+            movies = raw["movies"]
+        if isinstance(raw.get("candidates"), list):
+            roles = [{"role": raw.get("role") or raw.get("name_hint") or "Lead", "candidates": raw["candidates"], "movies": raw.get("movies", [])}]
+    elif isinstance(raw, str):
+        parsed = try_extract_json_from_string(raw)
+        if isinstance(parsed, list):
+            if parsed and isinstance(parsed[0], dict) and ("role" in parsed[0] or "candidates" in parsed[0]):
+                roles = parsed
+            else:
+                for v in parsed:
+                    if isinstance(v, dict):
+                        if "role" in v or "candidates" in v:
+                            roles.append(v)
+                        if "imdbID" in v or "Title" in v or "Poster" in v:
+                            movies.append(v)
+
+    # top-level keys fallback
+    if not roles:
+        if isinstance(crew_out.get("candidates"), list) or isinstance(crew_out.get("recommended_pool"), list):
+            # wrap into a single default role
+            roles = [{"role": crew_out.get("role") or "Lead", "candidates": crew_out.get("candidates") or crew_out.get("recommended_pool"), "movies": crew_out.get("movies") or []}]
+        elif isinstance(crew_out.get("movies"), list):
+            movies = crew_out.get("movies")
+
+    # tasks outputs (extract from task-level outputs)
+    tasks = crew_out.get("tasks") or []
+    if isinstance(tasks, list):
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
+            if isinstance(out, str):
+                parsed = try_extract_json_from_string(out)
+                if parsed is not None:
+                    out = parsed
+            if isinstance(out, list):
+                if out and isinstance(out[0], dict) and ("role" in out[0] or "candidates" in out[0]):
+                    roles = out
+                if out and isinstance(out[0], dict) and ("imdbID" in out[0] or "Title" in out[0] or "Poster" in out[0]):
+                    movies = out
+            if isinstance(out, dict):
+                if "candidates" in out and isinstance(out["candidates"], list):
+                    roles.append({"role": out.get("role") or out.get("name_hint") or "Lead", "candidates": out["candidates"], "movies": out.get("movies") or []})
+                if "movies" in out and isinstance(out["movies"], list):
+                    movies = out["movies"]
+
+    return roles, movies
+
+def parse_fee_to_int(value: Any) -> Optional[int]:
+    """
+    Accept numeric, string with digits, or range like '25,00,000-35,00,000' and return integer INR.
+    If multiple numbers present, take midpoint. Returns None if not parseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    numbers = re.findall(r"\d+", s)
+    if not numbers:
+        return None
+    nums = [int(n) for n in numbers]
+    if len(nums) == 1:
+        return nums[0]
+    # if many numbers, try to find a reasonably sized pair at the end (handles long urls with digits)
+    # prefer first two or last two
+    if len(nums) >= 2:
+        first, last = nums[0], nums[-1]
+        return int((first + last) / 2)
+    return None
 
 def compute_candidate_stats(candidate: Dict[str, Any], movies_for_role: List[Dict[str, Any]], usd_to_inr: float) -> Dict[str, Any]:
-    """
-    Build helpful stats for the candidate:
-    - avg_imdb (prefer candidate.imdb_rating then movie imdbRatings)
-    - avg_box_office_inr (average over matched movies with BoxOfficeINR)
-    - matched_movies (list of matched movie dicts)
-    """
     out: Dict[str, Any] = {}
-    # candidate-level fields
     out["name"] = pick_first(candidate, ["name", "actor", "actor_name", "title"], "Unknown")
-    out["score"] = pick_first(candidate, ["score", "combined_score", "raw_score", "popularity_score"], None)
-    # Candidate may include imdb_rating (your crew sometimes provides this)
+    # candidate-level imdb
     c_imdb = pick_first(candidate, ["imdb_rating", "average_imdb_rating", "avg_imdb", "imdb"], None)
-    if c_imdb is not None:
-        try:
-            out["avg_imdb"] = float(c_imdb)
-        except Exception:
-            out["avg_imdb"] = None
-    else:
-        out["avg_imdb"] = None
-
-    # Try to match candidate -> movies
+    out["avg_imdb"] = float(c_imdb) if (c_imdb is not None and str(c_imdb).replace('.', '').isdigit()) else None
+    # match movies by provided titles or ids
     matched = []
-    # candidate might list relevant_movie_titles or movie ids
-    titles = candidate.get("relevant_movie_titles") or candidate.get("movies") or candidate.get("relevant_movies") or []
+    titles = candidate.get("relevant_movie_titles") or candidate.get("relevant_movies") or []
     ids = candidate.get("relevant_movie_ids") or candidate.get("movie_ids") or candidate.get("movies_ids") or []
-    # Normalize titles to lowercase for matching
     lc_titles = {t.lower(): t for t in (titles or []) if isinstance(t, str)}
-    lc_ids = {i: i for i in (ids or []) if isinstance(i, str) or isinstance(i, int)}
-
+    lc_ids = {str(i): i for i in (ids or []) if isinstance(i, (str, int))}
     for m in movies_for_role or []:
         if not isinstance(m, dict):
             continue
-        m_title = (m.get("Title") or m.get("title") or "").strip()
-        m_id = m.get("imdbID") or m.get("imdb_id") or m.get("movie_id") or m.get("id")
-        matched_by_title = m_title and (m_title.lower() in lc_titles)
-        matched_by_id = m_id and (str(m_id) in lc_ids)
-        # also match by substring if no direct exact match (helps with small title variants)
-        if not (matched_by_title or matched_by_id) and m_title and lc_titles:
+        mt = (m.get("Title") or m.get("title") or "").strip()
+        mid = m.get("imdbID") or m.get("imdb_id") or m.get("movie_id") or m.get("id")
+        matched_by_title = mt and (mt.lower() in lc_titles)
+        matched_by_id = mid and (str(mid) in lc_ids)
+        if not (matched_by_title or matched_by_id) and mt and lc_titles:
             for t_low in lc_titles.keys():
-                if t_low in m_title.lower() or m_title.lower() in t_low:
+                if t_low in mt.lower() or mt.lower() in t_low:
                     matched_by_title = True
                     break
         if matched_by_title or matched_by_id:
             matched.append(m)
-
-    # If no explicit candidate->movie map provided, attempt to assign movies by actor appearing in movie Actors field
+    # fallback: match by actor name presence in movie Actors field
     if not matched:
-        cand_name = out["name"]
-        if cand_name and movies_for_role:
+        nm = out["name"]
+        if nm and movies_for_role:
             for m in movies_for_role:
                 actors_str = (m.get("Actors") or m.get("actors") or "")
-                if isinstance(actors_str, str) and cand_name.lower() in actors_str.lower():
+                if isinstance(actors_str, str) and nm.lower() in actors_str.lower():
                     matched.append(m)
-
-    # Compute average imdb & average box office INR from matched movies if candidate-level avg_imdb missing
+    # compute avg imdb and avg box
     imdb_vals = []
     box_vals = []
     for mm in matched:
@@ -220,45 +390,34 @@ def compute_candidate_stats(candidate: Dict[str, Any], movies_for_role: List[Dic
                 imdb_vals.append(float(mr))
         except Exception:
             pass
-        # BoxOffice numeric fields already in INR in your crew output; normalize
         bi = mm.get("BoxOfficeINR") or mm.get("box_office_inr") or mm.get("box_office") or mm.get("boxOffice")
-        # if BoxOfficeINR is None, try parsing BoxOffice string
         if bi is None:
-            # leave None
-            pass
+            # parse from strings if available
+            bi = pick_first(mm.get("_raw") or mm, ["BoxOffice", "box_office"])
+            if bi:
+                parsed = parse_money_str_to_int(bi, usd_to_inr)
+                if parsed:
+                    box_vals.append(parsed)
         else:
             try:
                 if isinstance(bi, (int, float)):
                     box_vals.append(int(bi))
                 else:
-                    # try to parse numeric string
-                    digits = re.sub(r"[^0-9]", "", str(bi))
+                    digits = re.sub(r"[^\d]", "", str(bi))
                     if digits:
                         box_vals.append(int(digits))
             except Exception:
                 pass
-
-    # average imdb fallback
     if out["avg_imdb"] is None and imdb_vals:
-        try:
-            out["avg_imdb"] = sum(imdb_vals) / len(imdb_vals)
-        except Exception:
-            out["avg_imdb"] = None
-
-    # avg box office
-    if box_vals:
-        try:
-            out["avg_box_inr"] = int(sum(box_vals) / len(box_vals))
-        except Exception:
-            out["avg_box_inr"] = None
-    else:
-        out["avg_box_inr"] = None
-
+        out["avg_imdb"] = sum(imdb_vals) / len(imdb_vals)
+    out["avg_box_inr"] = int(sum(box_vals) / len(box_vals)) if box_vals else None
     out["matched_movies"] = matched
+    # fee
+    fee_raw = pick_first(candidate, ["implied_actor_fee_estimate", "implied_fee", "fee", "estimated_fee", "actor_fee_inr"], None)
+    out["fee_inr"] = parse_fee_to_int(fee_raw)
     return out
 
-
-# -------------------- Streamlit UI --------------------
+# ---- Streamlit UI ----
 st.set_page_config(page_title="Right Casting Choice AI — Final", layout="wide")
 st.title("🎬 Right Casting Choice AI — Final")
 
@@ -279,7 +438,7 @@ else:
     unit_label = "M"
     multiplier = 1_000_000
 
-plot = st.text_area("Movie plot", value="A righteous and fearless police officer takes on corruption and crime to restore justice in his city.", height=150)
+plot = st.text_area("Movie plot", value="A righteous and fearless police officer takes on corruption and crime to restore justice in his city.", height=140)
 run_btn = st.button("Run Crew Flow")
 
 if not run_btn:
@@ -287,6 +446,7 @@ if not run_btn:
     st.stop()
 
 user_budget_raw = int(user_budget_ui * multiplier)
+plot_name_hints = extract_name_hints_from_plot(plot)
 inputs = {
     "plot": plot,
     "n_similar": int(n_similar),
@@ -294,104 +454,137 @@ inputs = {
     "user_budget_inr": int(user_budget_raw) if industry == "bollywood" else None,
     "user_budget_usd": int(user_budget_raw) if industry == "hollywood" else None,
     "industry": industry,
+    # upfront expected names/count hints to improve recall
+    "expected_character_names": plot_name_hints if plot_name_hints else None,
+    "expected_character_count": len(plot_name_hints) if plot_name_hints else None,
 }
 
-# spinner while crew runs
+# spinner while crew runs (no extra message after it completes)
 with st.spinner("Running crew pipeline..."):
     crew_output = safe_crew_kickoff(inputs)
 
-# ---------- parse roles and movies ----------
-def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    roles = []
-    movies = []
-    if isinstance(crew_out, dict):
-        raw = crew_out.get("raw")
-        if isinstance(raw, list):
-            if raw and isinstance(raw[0], dict) and ("role" in raw[0] or "candidates" in raw[0] or "name_hint" in raw[0]):
-                roles = raw
-            else:
-                for v in raw:
-                    if isinstance(v, dict):
-                        if "role" in v or "candidates" in v or "name_hint" in v:
-                            roles.append(v)
-                        if "imdbID" in v or "Title" in v or "poster" in v:
-                            movies.append(v)
-        elif isinstance(raw, dict):
-            if "movies" in raw and isinstance(raw["movies"], list):
-                movies = raw["movies"]
-            if "candidates" in raw and isinstance(raw["candidates"], list):
-                roles = [{"role": raw.get("role") or raw.get("name_hint") or "Lead", "candidates": raw["candidates"], "movies": raw.get("movies", [])}]
-        elif isinstance(raw, str):
-            parsed = try_extract_json_from_string(raw)
-            if isinstance(parsed, list):
-                if parsed and isinstance(parsed[0], dict) and ("role" in parsed[0] or "candidates" in parsed[0] or "name_hint" in parsed[0]):
-                    roles = parsed
-                else:
-                    for v in parsed:
-                        if isinstance(v, dict):
-                            if "role" in v or "candidates" in v or "name_hint" in v:
-                                roles.append(v)
-                            if "imdbID" in v or "Title" in v or "poster" in v:
-                                movies.append(v)
-
-        if not roles:
-            if isinstance(crew_out.get("candidates"), list) and isinstance(crew_out.get("recommended_pool"), list):
-                roles = [{"role": "Lead", "name_hint": "Lead", "candidates": crew_out.get("candidates"), "recommended_pool": crew_out.get("recommended_pool")}]
-            elif isinstance(crew_out.get("recommended_pool"), list) and isinstance(crew_out.get("movies"), list):
-                roles = [{"role": "Lead", "name_hint": "Lead", "candidates": crew_out.get("recommended_pool"), "movies": crew_out.get("movies")}]
-            elif isinstance(crew_out.get("movies"), list) and not movies:
-                movies = crew_out.get("movies")
-
-        tasks = crew_out.get("tasks") or []
-        if isinstance(tasks, list):
-            for t in tasks:
-                if not isinstance(t, dict):
-                    continue
-                out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
-                if isinstance(out, str):
-                    parsed = try_extract_json_from_string(out)
-                    if parsed is not None:
-                        out = parsed
-                if isinstance(out, list) and out:
-                    if isinstance(out[0], dict) and ("role" in out[0] or "candidates" in out[0] or "name_hint" in out[0]):
-                        roles = out
-                    if isinstance(out[0], dict) and ("imdbID" in out[0] or "Title" in out[0] or "poster" in out[0]):
-                        movies = out
-                if isinstance(out, dict):
-                    if "candidates" in out and isinstance(out["candidates"], list):
-                        role_name = out.get("role") or out.get("name_hint") or "Lead"
-                        roles.append({"role": role_name, "candidates": out["candidates"], "movies": out.get("movies") or []})
-                    if "movies" in out and isinstance(out["movies"], list):
-                        movies = out["movies"]
-    return roles, movies
-
-
+# parse roles & movies
 roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
 
-# last-resort find roles
+# detect initial character list from extractor task output, and retry if final roles
+# don't include the same characters (by count or by names)
+def detect_characters_from_tasks(out: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chars: List[Dict[str, Any]] = []
+    tasks = out.get("tasks") or []
+    if not isinstance(tasks, list):
+        return chars
+    best_len = 0
+    best_list: List[Dict[str, Any]] = []
+    for t in tasks:
+        try:
+            if not isinstance(t, dict):
+                continue
+            text = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
+            if isinstance(text, str):
+                parsed = try_extract_json_from_string(text)
+            else:
+                parsed = text
+            if isinstance(parsed, list) and parsed:
+                # likely extractor output if objects contain character fields
+                if isinstance(parsed[0], dict) and ("role" in parsed[0] or "name_hint" in parsed[0] or "gender" in parsed[0]):
+                    curr = [c for c in parsed if isinstance(c, dict)]
+                    if len(curr) > best_len:
+                        best_len = len(curr)
+                        best_list = curr
+        except Exception:
+            continue
+    return best_list or chars
+
+initial_chars = detect_characters_from_tasks(crew_output)
+initial_detected_count = len(initial_chars)
+
+# Fallback: if extractor yielded nothing, seed from plot-derived hints
+if not initial_chars and plot_name_hints:
+    initial_chars = [
+        {"name_hint": n, "gender": "", "age_range": "", "traits": []}
+        for n in plot_name_hints
+    ]
+    initial_detected_count = len(initial_chars)
+
+def _get_char_name(c: Dict[str, Any]) -> Optional[str]:
+    return pick_first(c, ["name_hint", "role", "name"], None)
+
+expected_names: List[str] = []
+initial_by_name: Dict[str, Dict[str, Any]] = {}
+for c in initial_chars:
+    nm = _get_char_name(c)
+    if nm:
+        if nm not in expected_names:
+            expected_names.append(nm)
+        initial_by_name[nm] = c
+
+# Merge in plot-derived hints to strengthen retries/warnings
+for nm in plot_name_hints or []:
+    if nm and nm not in expected_names:
+        expected_names.append(nm)
+if len(plot_name_hints or []) > initial_detected_count:
+    initial_detected_count = len(plot_name_hints or [])
+
+def _get_role_name(rb: Dict[str, Any]) -> Optional[str]:
+    return pick_first(rb, ["name_hint", "nameHint", "role"], None)
+
+def _names_missing(roles: Optional[List[Dict[str, Any]]]) -> List[str]:
+    if not expected_names:
+        return []
+    final_names = []
+    if isinstance(roles, list):
+        for rb in roles:
+            if isinstance(rb, dict):
+                rn = _get_role_name(rb)
+                if rn:
+                    final_names.append(rn)
+    missing = [n for n in expected_names if n not in set(final_names)]
+    return missing
+
+returned_less_than_detected = False
+max_retries = 3
+retry_count = 0
+missing_names = _names_missing(roles_list)
+while initial_detected_count and retry_count < max_retries and (
+    (isinstance(roles_list, list) and len(roles_list) < initial_detected_count) or (missing_names)
+):
+    retry_count += 1
+    augmented_inputs = dict(inputs)
+    augmented_inputs["expected_character_count"] = initial_detected_count
+    augmented_inputs["expected_character_names"] = expected_names
+    with st.spinner(f"Retrying to include all {initial_detected_count} characters (attempt {retry_count}/{max_retries})..."):
+        crew_output = safe_crew_kickoff(augmented_inputs)
+        roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
+        missing_names = _names_missing(roles_list)
+
+if initial_detected_count and (
+    (isinstance(roles_list, list) and len(roles_list) < initial_detected_count) or (missing_names)
+):
+    returned_less_than_detected = True
+
+# if roles empty, attempt recursive heuristic find
 if not roles_list:
     def find_roles_recursive(obj):
         if isinstance(obj, list):
             if obj and isinstance(obj[0], dict):
-                sample = obj[0]
-                if ("name" in sample and ("score" in sample or "movies" in sample)) or ("role" in sample and "candidates" in sample):
+                s = obj[0]
+                if ("name" in s and ("score" in s or "movies" in s)) or ("role" in s and "candidates" in s):
                     return obj
-            for item in obj:
-                res = find_roles_recursive(item)
-                if res:
-                    return res
+            for it in obj:
+                r = find_roles_recursive(it)
+                if r:
+                    return r
         elif isinstance(obj, dict):
             for v in obj.values():
-                res = find_roles_recursive(v)
-                if res:
-                    return res
+                r = find_roles_recursive(v)
+                if r:
+                    return r
         return None
     maybe = find_roles_recursive(crew_output)
     if maybe:
-        if isinstance(maybe, list) and maybe and isinstance(maybe[0], dict) and "name" in maybe[0]:
-            roles_list = [{"role": "Lead", "name_hint": "Lead", "candidates": maybe, "movies": movies_list}]
+        roles_list = [{"role": "Lead", "name_hint": "Lead", "candidates": maybe, "movies": movies_list}]
 
-# If movies_list empty but roles contain movies, collect
+# gather movies if empty
 if not movies_list and roles_list:
     collected = []
     for r in roles_list:
@@ -402,35 +595,190 @@ if not movies_list and roles_list:
 
 # dedupe movies by imdbID
 seen = set()
-dedup_movies = []
+dedup = []
 for m in (movies_list or []):
     mid = m.get("imdbID") or m.get("imdb_id") or m.get("movie_id") or m.get("id")
     if mid:
         if mid in seen:
             continue
         seen.add(mid)
-    dedup_movies.append(m)
-movies_list = dedup_movies
+    dedup.append(m)
+movies_list = dedup
+
+# Show detected characters summary (count + traits)
+if initial_detected_count:
+    st.subheader("Detected Characters")
+    det_rows = []
+    for c in initial_chars:
+        nm = _get_char_name(c) or "Unknown"
+        gen = pick_first(c, ["gender", "sex"], "")
+        age = pick_first(c, ["age_range", "estimated_age_at_peak_performance_for_role"], "")
+        traits = c.get("traits") or c.get("notes") or []
+        if isinstance(traits, list):
+            traits_str = ", ".join(map(str, traits))
+        else:
+            traits_str = str(traits)
+        det_rows.append({
+            "Character": nm,
+            "Gender": gen,
+            "Age Range": age,
+            "Traits": traits_str,
+        })
+    try:
+        st.dataframe(pd.DataFrame(det_rows), use_container_width=True)
+    except Exception:
+        st.write(det_rows)
+    st.caption(f"Detected {initial_detected_count} character(s) from the extractor.")
 
 # Tabs
 tab_candidates, tab_movies = st.tabs(["📋 Candidate Pool", "🎞 Similar Movies & Posters"])
 
-# Candidate Pool tab
+# Candidate Pool
 with tab_candidates:
     st.header(f"Audition List ({industry.capitalize()})")
+    if returned_less_than_detected:
+        if initial_detected_count and isinstance(roles_list, list):
+            final_names = [_get_role_name(rb) for rb in roles_list if isinstance(rb, dict)]
+            final_names = [n for n in final_names if n]
+            still_missing = [n for n in expected_names if n not in set(final_names)]
+            if still_missing:
+                st.warning(
+                    f"Returned {len(roles_list)} of detected {initial_detected_count} characters; missing: {', '.join(still_missing)}. Showing best effort."
+                )
+            else:
+                st.warning(
+                    f"Returned {len(roles_list)} of detected {initial_detected_count} characters. Showing best effort."
+                )
+        else:
+            st.warning("Final candidate list does not include all initially detected characters. Showing best effort.")
+    # schema normalization helpers
+    def normalize_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
+        nc: Dict[str, Any] = {}
+        nc["name"] = pick_first(c, ["name", "actor", "actor_name", "title"], "Unknown")
+        # imdb rating
+        ir = pick_first(c, ["imdb_rating", "average_imdb_rating", "avg_imdb", "imdb"], None)
+        try:
+            nc["imdb_rating"] = float(ir) if ir is not None else None
+        except Exception:
+            nc["imdb_rating"] = None
+        # box office
+        abo = pick_first(c, ["average_box_office_inr", "avg_box_office_inr", "avg_box_inr", "box_office_inr"], None)
+        try:
+            nc["average_box_office_inr"] = int(abo) if abo is not None else None
+        except Exception:
+            nc["average_box_office_inr"] = None
+        # fee
+        fee_raw = pick_first(c, ["implied_actor_fee_estimate", "implied_fee", "fee", "estimated_fee", "actor_fee_inr"], None)
+        nc["implied_actor_fee_estimate"] = parse_fee_to_int(fee_raw)
+        # source
+        nc["fee_source"] = pick_first(c, ["fee_source", "notes", "note", "explanation"], "")
+        # score
+        sc = pick_first(c, ["score", "combined_score", "raw_score"], None)
+        try:
+            nc["score"] = float(sc) if sc is not None else None
+        except Exception:
+            nc["score"] = None
+        # passthrough hints
+        nc["gender"] = pick_first(c, ["gender", "sex"], None)
+        nc["age_range"] = pick_first(c, ["estimated_age_at_peak_performance_for_role", "age_range"], None)
+        return nc
+
+    def normalize_role_block(rb: Dict[str, Any]) -> Dict[str, Any]:
+        nr: Dict[str, Any] = {}
+        nr["role"] = rb.get("role") or "Role"
+        nr["name_hint"] = pick_first(rb, ["name_hint", "nameHint"], "")
+        nr["age_range"] = pick_first(rb, ["age_range", "estimated_age_at_peak_performance_for_role"], "")
+        nr["gender"] = rb.get("gender") or ""
+        nr["traits"] = rb.get("traits") or rb.get("notes") or []
+        # Enrich missing traits/gender/age from initial detection by name match
+        nm_for_lookup = nr["name_hint"] or nr["role"]
+        if nm_for_lookup in initial_by_name:
+            src = initial_by_name[nm_for_lookup]
+            if not nr["gender"]:
+                nr["gender"] = pick_first(src, ["gender", "sex"], "") or nr["gender"]
+            if not nr["age_range"]:
+                nr["age_range"] = pick_first(src, ["age_range", "estimated_age_at_peak_performance_for_role"], "") or nr["age_range"]
+            if not nr["traits"]:
+                nr["traits"] = src.get("traits") or src.get("notes") or nr["traits"]
+        # movies list passthrough
+        mlist = rb.get("movies") or movies_list or []
+        nr["movies"] = mlist if isinstance(mlist, list) else []
+        # candidates
+        cand_list = rb.get("candidates") or rb.get("recommended_pool") or []
+        if not isinstance(cand_list, list):
+            cand_list = []
+        nr["candidates"] = [normalize_candidate(c) for c in cand_list if isinstance(c, dict)]
+        # recommended pool = top 6 by score
+        sorted_pool = sorted(nr["candidates"], key=lambda x: (x.get("score") or 0.0, - (x.get("implied_actor_fee_estimate") or 0)), reverse=True)
+        nr["recommended_pool"] = sorted_pool[:6]
+        return nr
     if not roles_list:
-        st.info("No role/candidate data could be found in crew output. Check crew logs or task outputs.")
+        st.info("No role/candidate data found in crew output. See raw output below.")
     else:
+        # normalize schema for UI
+        roles_list = [normalize_role_block(r) for r in roles_list if isinstance(r, dict)]
+        grand_total_fee_inr = 0  # sum of selected top candidate fees per role
+        grand_roles_with_selected = 0
+
+        def ensure_candidates(role_block: Dict[str, Any], movies_for_role: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            cand_list = role_block.get("candidates") or role_block.get("recommended_pool") or []
+            if cand_list and isinstance(cand_list, list):
+                return cand_list
+            # Derive simple actor list from movie metadata
+            actor_names = []
+            for mv in movies_for_role or []:
+                actors_str = mv.get("Actors") or mv.get("actors") or ""
+                if isinstance(actors_str, str) and actors_str:
+                    for raw in actors_str.split(","):
+                        nm = raw.strip()
+                        if nm and nm.lower() not in {a.lower() for a in actor_names}:
+                            actor_names.append(nm)
+                if len(actor_names) >= 5:
+                    break
+            derived = [{"name": nm} for nm in actor_names[:5]]
+            # If still empty, try Serper Dev Tool to propose candidates
+            if not derived:
+                try:
+                    from crewai_tools import SerperDevTool
+                    role = role_block.get("role") or role_block.get("name_hint") or "lead"
+                    gender = (role_block.get("gender") or "").strip()
+                    age = (role_block.get("age_range") or "").strip()
+                    industry_hint = "Bollywood" if industry == "bollywood" else "Hollywood"
+                    query = f"best {industry_hint} actors for {role} role {gender} {age}"
+                    serper = SerperDevTool()
+                    results = serper.run(query)
+                    text_blob = results if isinstance(results, str) else json.dumps(results)
+                    possible = re.findall(r"[A-Z][a-z]+\s+[A-Z][a-z]+", text_blob)
+                    unique_names = []
+                    for nm in possible:
+                        if nm.lower() not in {a.lower() for a in unique_names}:
+                            unique_names.append(nm)
+                        if len(unique_names) >= 5:
+                            break
+                    for nm in unique_names:
+                        derived.append({"name": nm})
+                except Exception:
+                    pass
+            if not derived:
+                derived = [{"name": "Placeholder Actor"}]
+            return derived
+
         for role_block in roles_list:
-            role_name = role_block.get("role") or role_block.get("name_hint") or "Role"
+            role_name = role_block.get("role") or "Role"
+            name_hint = role_block.get("name_hint") or role_block.get("nameHint") or ""
             age_hint = role_block.get("age_range") or role_block.get("estimated_age_at_peak_performance_for_role") or ""
             gender_hint = role_block.get("gender") or ""
             traits = role_block.get("traits") or role_block.get("notes") or []
+
+            # Build header including name_hint (if present)
             header = f"Role: {role_name}"
+            if name_hint:
+                header += f" — name hint: {name_hint}"
             if age_hint:
                 header += f" ({age_hint})"
             if gender_hint:
                 header += f" — {gender_hint.capitalize()}"
+
             with st.expander(header, expanded=False):
                 if traits:
                     if isinstance(traits, list):
@@ -438,15 +786,20 @@ with tab_candidates:
                     else:
                         st.write(f"**Traits / Notes:** {str(traits)}")
 
-                candidates = role_block.get("candidates") or role_block.get("recommended_pool") or []
                 movies_for_role = role_block.get("movies") or movies_list or []
+                candidates = role_block.get("candidates") or ensure_candidates(role_block, movies_for_role)
 
-                if not candidates:
-                    st.write("No actors found for this role.")
-                    continue
-
-                # Build rows
                 rows = []
+                selected_candidate_fee_inr: Optional[int] = None
+                selected_candidate_name: Optional[str] = None
+                best_score_val: Optional[float] = None
+
+                def _low_trust_fee_source(src: str) -> bool:
+                    if not src:
+                        return False
+                    s = src.lower()
+                    return ("networth" in s) or ("net worth" in s) or ("celebritynetworth" in s)
+
                 for c in candidates:
                     if not isinstance(c, dict):
                         continue
@@ -456,25 +809,114 @@ with tab_candidates:
                     age_range = pick_first(c, ["estimated_age_at_peak_performance_for_role", "age_range"], "")
                     avg_imdb = stats.get("avg_imdb")
                     avg_bo_inr = stats.get("avg_box_inr")
-                    score = stats.get("score")
-                    # format display
-                    bo_display = ""
+                    score = pick_first(c, ["score", "combined_score", "raw_score"], None)
+                    fee_inr = stats.get("fee_inr") if "fee_inr" in stats else None
+                    if fee_inr is None:
+                        # also attempt to parse directly from candidate top-level keys
+                        fee_inr = parse_fee_to_int(pick_first(c, ["implied_actor_fee_estimate", "implied_fee", "fee", "estimated_fee", "actor_fee_inr"], None))
+                    src_txt = pick_first(c, ["fee_source", "notes", "note", "explanation"], "") or ""
+                    low_trust = _low_trust_fee_source(src_txt)
+                    if low_trust:
+                        # Ignore low-trust net-worth sources for selection math
+                        fee_inr_for_selection = None
+                    else:
+                        fee_inr_for_selection = fee_inr
+                    fee_display = ""
+                    if isinstance(fee_inr, int):
+                        if industry == "hollywood":
+                            fee_usd = fee_inr / usd_to_inr
+                            fee_display = f"${(fee_usd / 1_000_000):,.2f} M"
+                        else:
+                            fee_display = f"₹{(fee_inr / 10_000_000):,.2f} Cr"
+                        # selection logic
+                        try:
+                            numeric_score = float(score) if score is not None else None
+                        except Exception:
+                            numeric_score = None
+                        should_select = False
+                    if selected_candidate_fee_inr is None:
+                            should_select = True
+                    elif numeric_score is not None and (best_score_val is None or numeric_score > best_score_val):
+                            should_select = True
+                    elif (
+                        numeric_score is not None and best_score_val is not None and numeric_score == best_score_val and
+                        (fee_inr_for_selection is not None and selected_candidate_fee_inr is not None and fee_inr_for_selection < selected_candidate_fee_inr)
+                    ):
+                            should_select = True
+                    if should_select and fee_inr_for_selection is not None:
+                        selected_candidate_fee_inr = fee_inr_for_selection
+                        selected_candidate_name = name
+                        best_score_val = numeric_score
+
+                    # display average box office in proper currency
                     if isinstance(avg_bo_inr, (int, float)):
-                        bo_display = f"{currency_symbol}{(avg_bo_inr / multiplier):,.2f} {unit_label}"
+                        if industry == "hollywood":
+                            avg_bo_display = f"${((avg_bo_inr / usd_to_inr) / 1_000_000):,.2f} M"
+                        else:
+                            avg_bo_display = f"₹{(avg_bo_inr / 10_000_000):,.2f} Cr"
+                    else:
+                        avg_bo_display = ""
+
+                    note_src = src_txt
+                    if low_trust:
+                        note_src = f"{src_txt} [flagged: net-worth source ignored for fee]"
                     rows.append({
                         "Actor Name": name,
                         "Gender": gender,
                         "Est. Age": age_range,
-                        f"Avg. BO ({unit_label})": bo_display,
+                        "Avg. BO": avg_bo_display,
                         "Avg. IMDB": (f"{avg_imdb:.1f}" if avg_imdb is not None else ""),
                         "Score": (f"{float(score):.4f}" if score is not None else ""),
-                        "Notes": pick_first(c, ["notes", "note", "explanation"], ""),
+                        "Implied Fee": fee_display,
+                        "Notes / Source": note_src
                     })
+
                 if rows:
-                    df = pd.DataFrame(rows)
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
                 else:
                     st.write("No presentable candidate data for this role.")
+
+                if selected_candidate_fee_inr is not None:
+                    if industry == "hollywood":
+                        fee_usd = selected_candidate_fee_inr / usd_to_inr
+                        st.markdown(f"**Selected Top Candidate:** {selected_candidate_name} — Fee: ${fee_usd/1_000_000:,.2f} M")
+                        # track grand total in USD for Hollywood
+                        grand_total_fee_inr += int(selected_candidate_fee_inr)  # keep raw INR for compatibility
+                    else:
+                        st.markdown(f"**Selected Top Candidate:** {selected_candidate_name} — Fee: ₹{selected_candidate_fee_inr/10_000_000:,.2f} Cr")
+                        grand_total_fee_inr += selected_candidate_fee_inr
+                else:
+                    st.markdown("**Selected Top Candidate:** No fee data available; cost omitted.")
+                grand_roles_with_selected += 1
+
+        # grand summary
+        st.markdown("---")
+        if grand_roles_with_selected:
+            if industry == "hollywood":
+                total_usd = (grand_total_fee_inr / usd_to_inr)
+                st.markdown(f"### Total cost (top candidate per role): **${total_usd/1_000_000:,.2f} M**")
+                st.markdown(f"### Your budget: **${user_budget_raw/1_000_000:,.2f} M**")
+                remaining_usd = user_budget_raw - total_usd
+                rem_display = f"${remaining_usd/1_000_000:,.2f} M"
+            else:
+                st.markdown(f"### Total cost (top candidate per role): **₹{grand_total_fee_inr/10_000_000:,.2f} Cr**")
+                st.markdown(f"### Your budget: **₹{user_budget_raw/10_000_000:,.2f} Cr**")
+                remaining_usd = None
+                remaining = user_budget_raw - grand_total_fee_inr
+                rem_display = f"₹{remaining/10_000_000:,.2f} Cr"
+            if industry == "hollywood":
+                if remaining_usd < 0:
+                    st.error(f"Budget exceeded. Remaining: {rem_display}")
+                else:
+                    st.success(f"Remaining budget after counted fees: {rem_display}")
+            else:
+                if remaining < 0:
+                    st.error(f"Budget exceeded. Remaining: {rem_display}")
+                else:
+                    st.success(f"Remaining budget after counted fees: {rem_display}")
+            st.caption("Note: cost uses only one selected top candidate per role (highest score; tie-break by lower fee).")
+        else:
+            st.info("No actor fee fields were parsed; total cost unavailable. Ensure your budget_ranker returns numeric implied_actor_fee_estimate in INR.")
 
 # Similar Movies tab
 with tab_movies:
@@ -482,17 +924,18 @@ with tab_movies:
     if not movies_list:
         st.info("No similar movies were returned by the crew.")
     else:
-        posters = []
+        posters: List[Dict[str, str]] = []
         rows = []
         seen_posters = set()
         for m in movies_list:
             if not isinstance(m, dict):
                 continue
-            poster = pick_first(m, ["Poster", "poster", "poster_url", "PosterUrl"], "")
-            title = pick_first(m, ["Title", "title", "name"], "")
-            year = pick_first(m, ["Year", "year"], "")
-            imdb = pick_first(m, ["imdbRating", "imdb_rating", "imdb"], "")
+            poster = pick_first(m, ["Poster", "poster", "poster_url", "PosterUrl"]) or pick_first(m.get("_raw") or {}, ["Poster", "poster"])
+            title = pick_first(m, ["Title", "title", "name"]) or ""
+            year = pick_first(m, ["Year", "year"]) or ""
+            imdb = pick_first(m, ["imdbRating", "imdb_rating", "imdb"]) or ""
             box_inr, _ = normalize_movie_boxoffice(m, usd_to_inr)
+            # add poster dedup
             if poster and poster not in seen_posters:
                 posters.append({"poster": poster, "title": title})
                 seen_posters.add(poster)
@@ -502,20 +945,21 @@ with tab_movies:
                 "IMDB": imdb,
                 "BoxOffice (INR)" if industry == "bollywood" else "BoxOffice (USD)": (box_inr if industry == "bollywood" else (int(box_inr / usd_to_inr) if box_inr else None))
             })
-        # show posters (top n_similar)
+        # posters row
         if posters:
             cols = st.columns(min(len(posters), n_similar))
             for i, p in enumerate(posters[:n_similar]):
                 with cols[i]:
                     st.image(p["poster"], use_column_width=True)
                     st.caption(p["title"])
+        # movie table
         try:
-            df_movies = pd.DataFrame(rows)
-            st.dataframe(df_movies, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
         except Exception:
             st.write(rows)
 
-# Show raw parsed JSON for debugging
+
+# debugging raw output
 st.subheader("Raw Crew Output (parsed)")
 st.json(crew_output)
 if isinstance(crew_output, dict):

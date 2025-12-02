@@ -6,6 +6,7 @@ from crewai_tools import SerperDevTool
 from .tools.omdb import OmdbTool
 import os
 import google.generativeai as genai
+
 # If you want to run a snippet of code before or after the crew starts,
 # you can use the @before_kickoff and @after_kickoff decorators
 # https://docs.crewai.com/concepts/crews#example-crew-class-with-decorators
@@ -25,12 +26,16 @@ class RightCastingChoiceAi():
     # https://docs.crewai.com/concepts/agents#agent-tools
     @agent
     def character_extractor(self) -> Agent:
-        # Gemini setup from env
-        gemini_key = (
-            os.getenv("GOOGLE_API_KEY")
-        )
+        # Ensure both env vars are set for Gemini (LiteLLM + google SDK)
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if gemini_key:
-            genai.configure(api_key=gemini_key)
+            os.environ.setdefault("GEMINI_API_KEY", gemini_key)
+            os.environ.setdefault("GOOGLE_API_KEY", gemini_key)
+            # Configure google-generativeai SDK (used by some tools)
+            try:
+                genai.configure(api_key=gemini_key)
+            except Exception:
+                pass
         return Agent(
             config=self.agents_config['character_extractor'], # type: ignore[index]
             llm="gemini/gemini-2.5-flash",
@@ -40,11 +45,25 @@ class RightCastingChoiceAi():
     @agent
     def similar_movies_and_omdb(self) -> Agent:
         # Provide Serper tool and OMDb wrapper via agent tools
+        # Normalize envs for external tools
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if gemini_key:
+            os.environ.setdefault("GEMINI_API_KEY", gemini_key)
+            os.environ.setdefault("GOOGLE_API_KEY", gemini_key)
+            try:
+                genai.configure(api_key=gemini_key)
+            except Exception:
+                pass
+        # Map SERPERDEV_API_KEY -> SERPER_API_KEY for SerperDevTool
+        serper_key = os.getenv("SERPER_API_KEY") or os.getenv("SERPERDEV_API_KEY")
+        if serper_key:
+            os.environ.setdefault("SERPER_API_KEY", serper_key)
         omdb_key = os.getenv("OMDB_API_KEY", "")
         omdb_tool = OmdbTool()
         tools = [SerperDevTool(), omdb_tool]
         return Agent(
-            config=self.agents_config['similar_movies_and_omdb'], # type: ignore[index]
+            # Strip any YAML-declared tools to avoid unresolved names
+            config={k: v for k, v in self.agents_config['similar_movies_and_omdb'].items() if k != 'tools'}, # type: ignore[index]
             tools=tools,
             llm="gemini/gemini-2.5-flash",
             verbose=True
@@ -52,8 +71,24 @@ class RightCastingChoiceAi():
 
     @agent
     def budget_ranker(self) -> Agent:
+        # Ensure Gemini envs present; attach tools programmatically
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if gemini_key:
+            os.environ.setdefault("GEMINI_API_KEY", gemini_key)
+            os.environ.setdefault("GOOGLE_API_KEY", gemini_key)
+            try:
+                genai.configure(api_key=gemini_key)
+            except Exception:
+                pass
+        # Map SERPERDEV_API_KEY -> SERPER_API_KEY for SerperDevTool
+        serper_key = os.getenv("SERPER_API_KEY") or os.getenv("SERPERDEV_API_KEY")
+        if serper_key:
+            os.environ.setdefault("SERPER_API_KEY", serper_key)
+        # Remove YAML 'tools' to prevent unresolved tool alias errors, attach tools programmatically
+        cfg = {k: v for k, v in self.agents_config['budget_ranker'].items() if k != 'tools'} # type: ignore[index]
         return Agent(
-            config=self.agents_config['budget_ranker'], # type: ignore[index]
+            config=cfg,
+            tools=[SerperDevTool()],
             llm="gemini/gemini-2.5-flash",
             verbose=True
         )
@@ -91,3 +126,8 @@ class RightCastingChoiceAi():
             process=Process.sequential,
             verbose=True,
         )
+
+    # Optional helper for app-level retries. It accepts augmented inputs like
+    # expected_character_count and expected_character_names to guide agents.
+    def kickoff_once(self, inputs: dict):
+        return self.crew().kickoff(inputs=inputs)
