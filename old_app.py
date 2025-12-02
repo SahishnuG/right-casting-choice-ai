@@ -100,26 +100,15 @@ def extract_name_hints_from_plot(plot_text: str) -> List[str]:
             if name not in seen:
                 candidates.append(name)
                 seen.add(name)
-    # Distinctive single tokens (capitalized words not at sentence start; allow hyphen digits)
-    banned = {
-        # places / organizations / generic words
-        "Neo", "Veridia", "Neo-Veridia", "Synthetic", "Alliance", "Bio-Lords", "Gilded", "Spire",
-        "Chronos", "Gem", "Sector", "Resistance", "Peace", "Market", "Moons", "Rooftops",
-        "Security", "Grid", "Apocalypse", "Black",
-        # noise tokens often captured by regex
-        "In", "They", "Unknown", "Meanwhile", "As", "Who", "Inside", "Living", "Coming",
-        "Leader", "Fanatical", "Shapeshifting", "Corporate", "Spy", "Head", "Ancient", "Mystic",
-        "Sewers", "Catalyst", "Digital", "Vault", "Key", "Two"
-    }
     for m in re.finditer(r"\b([A-Z][A-Za-z0-9-]+)\b", txt):
         token = m.group(1)
         # rudimentary filter: ignore at sentence starts followed by lowercase words that are common nouns
-        if token in banned or token in {"Baron", "Commander", "Agent", "The", "Unit"}:
+        if token in {"Baron", "Commander", "Agent", "The", "Unit"}:
             continue
         if token.upper() == token and len(token) <= 2:
             continue
         # prefer uncommon-looking names
-        if token and token[0].isupper() and token.lower() not in {t.lower() for t in banned}:
+        if token:
             # skip duplicates and words already part of a multiword match
             if any(token in mw for mw in candidates):
                 continue
