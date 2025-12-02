@@ -1,10 +1,12 @@
 character_extractor:
   role: "Casting Character Extractor"
-  goal: "Extract required characters and traits from the given plot using Gemini. Return JSON array only (atleast 2 items)."
+  goal: "Extract all characters and traits from the given plot using Gemini. Return JSON array only (2+ items when possible; if the plot has fewer, return all available)."
   backstory: "Expert at distilling story needs into clear character profiles. Only return JSON array, no explanation."
   llm: gemini/gemini-2.5-flash
   system_prompt: |
-    You are a JSON-only extractor. ALWAYS return a JSON array of 3-6 characters, and nothing else.
+    You are a JSON-only extractor. Return a JSON array containing ALL distinct characters mentioned in the plot (no upper limit).
+    Aim for at least 2 characters when possible; if the plot truly mentions fewer than 2, return whatever characters exist.
+    Treat named entities and titled roles (e.g., "The Weaver", "Unit X-5", "Baron Zog") as characters. Deduplicate by canonicalized name.
     Each character object must include: role, name_hint, age_range, gender, traits.
     Do NOT output any plain-text explanation or markdown — return only valid JSON.
     Example:

@@ -75,79 +75,44 @@ def try_extract_json_from_string(s: Optional[str]) -> Optional[Any]:
                 pass
     return None
 
-def extract_name_hints_from_plot(plot_text: str) -> List[str]:
-    """
-    Heuristic extraction of character names/handles from plot text to nudge the agents.
-    Captures multiword titles (e.g., 'Baron Zog', 'Commander Tane', 'Agent 99', 'The Weaver', 'Unit X-5')
-    and distinctive single tokens inferred from capitalization patterns. No hardcoded names.
-    """
-    if not plot_text:
-        return []
-    txt = plot_text.strip()
-    candidates: List[str] = []
-    seen = set()
-    # Multiword with titles
-    title_patterns = [
-        r"\bBaron\s+[A-Z][\w-]+\b",
-        r"\bCommander\s+[A-Z][\w-]+\b",
-        r"\bAgent\s+\d+[A-Za-z-]*\b|\bAgent\s+[A-Z][\w-]+\b",
-        r"\bThe\s+[A-Z][\w-]+\b",
-        r"\bUnit\s+[A-Z0-9-]+\b",
-    ]
-    for pat in title_patterns:
-        for m in re.finditer(pat, txt):
-            name = m.group(0)
-            if name not in seen:
-                candidates.append(name)
-                seen.add(name)
-    # Distinctive single tokens (capitalized words not at sentence start; allow hyphen digits)
-    banned = {
-        # places / organizations / generic words
-        "Neo", "Veridia", "Neo-Veridia", "Synthetic", "Alliance", "Bio-Lords", "Gilded", "Spire",
-        "Chronos", "Gem", "Sector", "Resistance", "Peace", "Market", "Moons", "Rooftops",
-        "Security", "Grid", "Apocalypse", "Black",
-        # noise tokens often captured by regex
-        "In", "They", "Unknown", "Meanwhile", "As", "Who", "Inside", "Living", "Coming",
-        "Leader", "Fanatical", "Shapeshifting", "Corporate", "Spy", "Head", "Ancient", "Mystic",
-        "Sewers", "Catalyst", "Digital", "Vault", "Key", "Two"
-    }
-    for m in re.finditer(r"\b([A-Z][A-Za-z0-9-]+)\b", txt):
-        token = m.group(1)
-        # rudimentary filter: ignore at sentence starts followed by lowercase words that are common nouns
-        if token in banned or token in {"Baron", "Commander", "Agent", "The", "Unit"}:
-            continue
-        if token.upper() == token and len(token) <= 2:
-            continue
-        # prefer uncommon-looking names
-        if token and token[0].isupper() and token.lower() not in {t.lower() for t in banned}:
-            # skip duplicates and words already part of a multiword match
-            if any(token in mw for mw in candidates):
-                continue
-            if token not in seen:
-                candidates.append(token)
-                seen.add(token)
-    # keep top 20 unique hints
-    return candidates[:20]
+# Intentionally no plot-based name extraction; rely solely on the extractor agent
 
-def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
+def safe_crew_kickoff(inputs: Dict[str, Any], max_retries: int = 1) -> Dict[str, Any]:
+    """Run crew with up to one retry on Gemini rate limits, respecting suggested delay."""
     try:
         crew = RightCastingChoiceAi().crew()
-        # Simple retry for rate limits
-        retries = 3
-        delay_sec = 4
         result = None
-        for attempt in range(retries):
+        last_error = None
+        attempts = max(1, int(max_retries) + 1)
+        for attempt in range(attempts):
             try:
                 result = crew.kickoff(inputs=inputs)
+                last_error = None
                 break
             except Exception as e:
+                last_error = e
                 msg = str(e)
-                if "RESOURCE_EXHAUSTED" in msg or "RateLimit" in msg or "quota" in msg.lower():
-                    if attempt < retries - 1:
-                        time.sleep(delay_sec)
-                        continue
-                # if not rate limit or out of retries, raise
-                raise
+                is_rate_limit = ("RESOURCE_EXHAUSTED" in msg or "RateLimit" in msg or "quota" in msg.lower())
+                if not is_rate_limit or attempt >= attempts - 1:
+                    break
+                # Parse suggested retry delay from Gemini error JSON if present
+                retry_seconds = None
+                try:
+                    jstart = msg.find('{')
+                    if jstart != -1:
+                        data = json.loads(msg[jstart:])
+                        details = (data.get("error") or {}).get("details") or []
+                        for d in details:
+                            if d.get("@type", "").endswith("RetryInfo"):
+                                rd = d.get("retryDelay")
+                                if isinstance(rd, str) and rd.endswith("s"):
+                                    retry_seconds = float(rd[:-1])
+                                elif isinstance(rd, (int, float)):
+                                    retry_seconds = float(rd)
+                                break
+                except Exception:
+                    retry_seconds = None
+                time.sleep(retry_seconds if retry_seconds else 30.0)
         # prefer to_dict
         if hasattr(result, "to_dict"):
             try:
@@ -177,6 +142,8 @@ def safe_crew_kickoff(inputs: Dict[str, Any]) -> Dict[str, Any]:
         parsed = try_extract_json_from_string(s)
         if parsed is not None:
             return {"raw": parsed}
+        if last_error is not None:
+            return {"error": f"Crew kickoff failed: {last_error}"}
         return {"raw": str(result)}
     except Exception as e:
         return {"error": f"Crew kickoff failed: {e}"}
@@ -418,8 +385,8 @@ def compute_candidate_stats(candidate: Dict[str, Any], movies_for_role: List[Dic
     return out
 
 # ---- Streamlit UI ----
-st.set_page_config(page_title="Right Casting Choice AI — Final", layout="wide")
-st.title("🎬 Right Casting Choice AI — Final")
+st.set_page_config(page_title="Right Casting Choice AI", layout="wide")
+st.title("🎬 Right Casting Choice AI")
 
 # Sidebar
 with st.sidebar:
@@ -446,7 +413,6 @@ if not run_btn:
     st.stop()
 
 user_budget_raw = int(user_budget_ui * multiplier)
-plot_name_hints = extract_name_hints_from_plot(plot)
 inputs = {
     "plot": plot,
     "n_similar": int(n_similar),
@@ -454,14 +420,17 @@ inputs = {
     "user_budget_inr": int(user_budget_raw) if industry == "bollywood" else None,
     "user_budget_usd": int(user_budget_raw) if industry == "hollywood" else None,
     "industry": industry,
-    # upfront expected names/count hints to improve recall
-    "expected_character_names": plot_name_hints if plot_name_hints else None,
-    "expected_character_count": len(plot_name_hints) if plot_name_hints else None,
 }
 
 # spinner while crew runs (no extra message after it completes)
 with st.spinner("Running crew pipeline..."):
     crew_output = safe_crew_kickoff(inputs)
+
+# Stop early with a friendly banner if rate-limited
+if isinstance(crew_output, dict) and crew_output.get("error"):
+    st.error("Gemini rate limit/quota hit. Please wait and retry.")
+    st.caption(str(crew_output.get("error")))
+    st.stop()
 
 # parse roles & movies
 roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
@@ -476,6 +445,7 @@ def detect_characters_from_tasks(out: Dict[str, Any]) -> List[Dict[str, Any]]:
     best_len = 0
     best_list: List[Dict[str, Any]] = []
     for t in tasks:
+        print(t)
         try:
             if not isinstance(t, dict):
                 continue
@@ -498,14 +468,6 @@ def detect_characters_from_tasks(out: Dict[str, Any]) -> List[Dict[str, Any]]:
 initial_chars = detect_characters_from_tasks(crew_output)
 initial_detected_count = len(initial_chars)
 
-# Fallback: if extractor yielded nothing, seed from plot-derived hints
-if not initial_chars and plot_name_hints:
-    initial_chars = [
-        {"name_hint": n, "gender": "", "age_range": "", "traits": []}
-        for n in plot_name_hints
-    ]
-    initial_detected_count = len(initial_chars)
-
 def _get_char_name(c: Dict[str, Any]) -> Optional[str]:
     return pick_first(c, ["name_hint", "role", "name"], None)
 
@@ -518,12 +480,7 @@ for c in initial_chars:
             expected_names.append(nm)
         initial_by_name[nm] = c
 
-# Merge in plot-derived hints to strengthen retries/warnings
-for nm in plot_name_hints or []:
-    if nm and nm not in expected_names:
-        expected_names.append(nm)
-if len(plot_name_hints or []) > initial_detected_count:
-    initial_detected_count = len(plot_name_hints or [])
+# Do not merge plot-derived hints; use only extractor output
 
 def _get_role_name(rb: Dict[str, Any]) -> Optional[str]:
     return pick_first(rb, ["name_hint", "nameHint", "role"], None)
@@ -542,7 +499,7 @@ def _names_missing(roles: Optional[List[Dict[str, Any]]]) -> List[str]:
     return missing
 
 returned_less_than_detected = False
-max_retries = 3
+max_retries = 1
 retry_count = 0
 missing_names = _names_missing(roles_list)
 while initial_detected_count and retry_count < max_retries and (
@@ -550,8 +507,7 @@ while initial_detected_count and retry_count < max_retries and (
 ):
     retry_count += 1
     augmented_inputs = dict(inputs)
-    augmented_inputs["expected_character_count"] = initial_detected_count
-    augmented_inputs["expected_character_names"] = expected_names
+    # No expected_* hints passed; rely entirely on extractor output
     with st.spinner(f"Retrying to include all {initial_detected_count} characters (attempt {retry_count}/{max_retries})..."):
         crew_output = safe_crew_kickoff(augmented_inputs)
         roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)

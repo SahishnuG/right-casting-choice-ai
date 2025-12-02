@@ -1,13 +1,15 @@
 extract_characters_task:
   description: >
-    Given the user plot string "{plot}", extract atleast 2 key characters and their
-    characteristics (role, name_hint, age_range, traits, gender). **Return JSON array only.**
+    Given the user plot string "{plot}", extract ALL distinct characters mentioned in the plot
+    (no upper limit) and their characteristics (role, name_hint, age_range, traits, gender).
+    Aim for at least 2 characters when possible; if the plot truly contains fewer than 2, return
+    all available characters. **Return JSON array only.**
     DO NOT include any explanatory text. The assistant must return a compact JSON array exactly.
     Optional hints from the app may be provided:
       - expected_character_count: ensure you return at least this many characters.
       - expected_character_names: ensure all listed names/roles are included (use as name_hint/role as appropriate).
   expected_output: >
-    A JSON array (atleast 2 items) like:
+    A JSON array (2+ items when possible; if the plot has fewer, return what's available) like:
     [
       {"role":"Lead Male","name_hint":"Arjun","age_range":"25-35","traits":["brave","reckless"], "gender":"male"},
       {"role":"Lead Female","name_hint":"Meera","age_range":"20-30","traits":["witty","fierce"], "gender":"female"}
