@@ -333,8 +333,8 @@ def compute_candidate_stats(candidate: Dict[str, Any], movies_for_role: List[Dic
 
 
 # ---- Streamlit UI ----
-st.set_page_config(page_title="Right Casting Choice AI — All Fixes", layout="wide")
-st.title("🎬 Right Casting Choice AI — All Fixes")
+st.set_page_config(page_title="Right Casting Choice AI — app1", layout="wide")
+st.title("🎬 Right Casting Choice AI")
 
 with st.sidebar:
     st.header("Settings")
@@ -672,5 +672,31 @@ st.subheader("Raw Crew Output (parsed)")
 st.json(crew_output)
 if isinstance(crew_output, dict):
     st.caption(f"Top-level keys: {list(crew_output.keys())}")
+
+# Explicitly show the output of similar_movies_task for debugging/visibility
+tasks = crew_output.get("tasks") or []
+similar_movies_payload = None
+try:
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t_name = (t.get("name") or t.get("id") or "").lower()
+        t_desc = str(t.get("description") or "").lower()
+        if ("similar_movies_task" in t_name) or ("similar movies" in t_desc):
+            raw_out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
+            if isinstance(raw_out, str):
+                parsed = try_extract_json_from_string(raw_out)
+                similar_movies_payload = parsed if parsed is not None else raw_out
+            else:
+                similar_movies_payload = raw_out
+            break
+except Exception:
+    similar_movies_payload = None
+
+st.subheader("similar_movies_task — Raw Output")
+if similar_movies_payload is not None:
+    st.json(similar_movies_payload)
+else:
+    st.info("No explicit output found for similar_movies_task in crew_output['tasks'].")
 
 st.success("Done — candidate pool and similar movies displayed.")

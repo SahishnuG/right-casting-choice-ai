@@ -29,6 +29,14 @@ similar_movies_and_omdb:
       - Derive 6-10 keywords from the input plot (entities, subgenres, motifs).
       - Prefer movies whose genres/subgenres and synopses align with those keywords; exclude off-theme results.
       - Compute a numeric match_score (0-100) per movie based on keyword overlap, genre match, and synopsis alignment.
+      - Respect the provided industry input:
+        * For Bollywood: bias search toward Indian/Hindi-language titles. Use queries with "Bollywood" and filter OMDb by Country/Language containing "India"/"Hindi". Deprioritize or exclude clear Hollywood-only results.
+        * For Hollywood: bias search toward US/international English-language titles.
+    Reliability requirements:
+      - You MUST return a non-empty JSON array. Target n_similar items; if fewer are found, still return whatever matches.
+      - If search yields zero results, perform a fallback query combining plot keywords + industry hint (e.g., "Bollywood heist sci-fi movies") and return at least 3 items that best match.
+      - Explicitly filter by OMDb `Country`/`Language`: for Bollywood require `Country` contains "India" OR `Language` contains "Hindi" (or other Indian languages); for Hollywood prefer `Country` contains "USA" and `Language` contains "English".
+      - Do not include any role/candidate data here; only the shared movies array.
     Output fields per item: Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID, match_score, _raw (raw OMDb result).
     Example:
     [
@@ -46,8 +54,10 @@ budget_ranker:
   system_prompt: |
     You are the Budget Ranker. IMPORTANT: Return ONLY valid JSON. Do NOT include any thoughts, analysis text, markdown, tables, or prose. If you need to think, do it silently and output just the final JSON.
     You receive a single shared array of similar movies (derived from the plot). Use this shared list for box office/IMDB features across ALL roles. Do NOT emit or duplicate a movies array per role.
-    For each character profile provided (role, name_hint, age_range, gender, traits):
+        For each character profile provided (role, name_hint, age_range, gender, traits):
       0. Build a comprehensive candidate pool by extracting ALL actor names from the shared similar-movies list (use the OMDb `Actors` field across all movies). Normalize names and deduplicate. This ensures supporting roles have a healthy candidate set even if prior tasks missed them.
+          - Respect industry: Bollywood → Indian/Hindi-language actors; Hollywood → US/international English-language actors. Drop obviously mismatched industry candidates.
+          - When in Bollywood mode, avoid clear Hollywood-only actors; when in Hollywood mode, avoid clear non-English-only actors unless internationally known for English-language films.
       1. Aggregate candidate actors from OMDb/previous tasks.
       2. For each actor, use the Serper Dev tool to search for their typical salary/fee per film using queries like:
          - "<actor name> salary per film", "<actor name> fee per movie", "<actor name> paid per film", "<actor name> earnings per movie INR"
@@ -84,4 +94,5 @@ budget_ranker:
              ...
            ]
       11. Always return numeric fee in raw INR integer (no crores suffix). If fee can't be found, set the field to null and document a short "fee_source": "not found".
-      12. The ONLY allowed output is the JSON array described. Do NOT include any headings like "Thought:", lists, tables, or explanations.
+      12. Reliability requirements: You MUST return one object per provided character profile. If any metric is unavailable, set it to null but still include the character block. Never return an empty array.
+      13. The ONLY allowed output is the JSON array described. Do NOT include any headings like "Thought:", lists, tables, or explanations.

@@ -23,6 +23,9 @@ similar_movies_task:
       - Extract 6-10 key plot keywords from {plot} (entities, subgenres, motifs).
       - Filter candidate movies by genre/subgenre and these keywords; exclude off-theme results.
       - Compute a numeric match_score (0-100) per movie based on keyword overlap, genre match, and synopsis alignment.
+      - Respect industry: if industry=bollywood, prefer Indian/Hindi-language titles and exclude clear Hollywood-only matches; if industry=hollywood, prefer US/English titles.
+      - Enforce OMDb Country/Language filters: Bollywood → `Country` contains "India" OR `Language` contains "Hindi" (or other Indian languages). Hollywood → prefer `Country` contains "USA" AND `Language` contains "English".
+      - Use Serper queries that include industry hints (e.g., "best Bollywood sci-fi heist movies" or "Hollywood sci-fi heist movies").
     Use USD→INR={usd_to_inr} when converting non-INR amounts for Bollywood preference.
     Return a single shared list of movie dicts with normalized fields.
   expected_output: >
@@ -34,6 +37,8 @@ rank_candidates_task:
     Aggregate actors from the OMDb results and compute scores given user_budget_inr or user_budget_usd
     depending on industry={industry}. The user's total budget will be provided as either user_budget_inr (Bollywood) or user_budget_usd (Hollywood); keep this overall budget in mind when choosing actors, preferring combinations that keep the sum of selected fees across roles within budget. Do NOT select the same actor for multiple roles. For each character profile returned by extract_characters_task:
       - First, construct a comprehensive candidate pool by using ALL actor names appearing in the shared similar-movies array (from OMDb `Actors` field across all returned movies). Normalize names and deduplicate. This ensures supporting roles have adequate candidates even if prior tasks missed them.
+      - Respect industry when forming candidate pools: Bollywood → Indian actors, Hindi filmographies; Hollywood → US/international English-language actors. If an actor is clearly mismatched to the selected industry, drop them.
+      - Bollywood mode: drop clear Hollywood-only actors (primarily US-only with no Indian/Hindi filmography). Hollywood mode: drop clear non-English-only actors unless widely known for English-language film work.
       - Ensure the returned candidate list respects the character's gender and age_range (drop mismatches).
       - If optional hints are provided from the app (expected_character_count / expected_character_names),
         ensure all those characters are included in the final JSON array.
@@ -72,5 +77,5 @@ rank_candidates_task:
       ...
     ]
   expected_output: >
-    A JSON array (at least 2 items) as shown above. Return valid JSON only (no extra commentary).
+    A JSON array (at least as many items as provided character profiles). Return valid JSON only (no extra commentary). If data is missing for any field, set it to null — never return an empty array.
   agent: budget_ranker
