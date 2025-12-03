@@ -18,21 +18,26 @@ extract_characters_task:
 
 similar_movies_task:
   description: >
-    Using the plot "{plot}", industry={industry}, and n_similar={n_similar}, run Serper to find
-    similar movie titles and fetch OMDb metadata for each. Use USD→INR={usd_to_inr} when converting
-    non-INR amounts for Bollywood preference. Return a list of movie dicts with normalized fields.
+    Using the plot "{plot}", industry={industry}, and n_similar={n_similar}, run Serper to find n_similar
+    movie titles and fetch OMDb metadata for each. Enforce thematic relevance:
+      - Extract 6-10 key plot keywords from {plot} (entities, subgenres, motifs).
+      - Filter candidate movies by genre/subgenre and these keywords; exclude off-theme results.
+      - Compute a numeric match_score (0-100) per movie based on keyword overlap, genre match, and synopsis alignment.
+    Use USD→INR={usd_to_inr} when converting non-INR amounts for Bollywood preference.
+    Return a single shared list of movie dicts with normalized fields.
   expected_output: >
-    A JSON array of dicts. Each dict includes: Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID, _raw
+    A JSON array of dicts. Each dict includes: Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID, match_score (int), _raw
   agent: similar_movies_and_omdb
 
 rank_candidates_task:
   description: >
     Aggregate actors from the OMDb results and compute scores given user_budget_inr or user_budget_usd
-    depending on industry={industry}. For each character profile returned by extract_characters_task:
+    depending on industry={industry}. The user's total budget will be provided as either user_budget_inr (Bollywood) or user_budget_usd (Hollywood); keep this overall budget in mind when choosing actors, preferring combinations that keep the sum of selected fees across roles within budget. Do NOT select the same actor for multiple roles. For each character profile returned by extract_characters_task:
+      - First, construct a comprehensive candidate pool by using ALL actor names appearing in the shared similar-movies array (from OMDb `Actors` field across all returned movies). Normalize names and deduplicate. This ensures supporting roles have adequate candidates even if prior tasks missed them.
       - Ensure the returned candidate list respects the character's gender and age_range (drop mismatches).
       - If optional hints are provided from the app (expected_character_count / expected_character_names),
         ensure all those characters are included in the final JSON array.
-      - If a character has no candidates after filtering, run Serper to find actors can play that character.
+      - If a character has no candidates after filtering, run Serper to find actors who can play that character.
       - For each actor candidate, query the web (via Serper) to estimate an actor fee per film.
         IMPORTANT: Use remuneration/salary/"per film fee" sources only. NEVER use "net worth" sources
         (e.g., pages with words like "net worth", "wealth", or sites such as celebritynetworth etc.).
@@ -42,8 +47,9 @@ rank_candidates_task:
       - If Serper returns a range, use the midpoint; if USD, convert using USD→INR.
       - Add a "fee_source" string (short provenance — URL or snippet). Ensure the source clearly references
         a per-project fee/remuneration, not net worth; otherwise search again.
-      - Compute a "score" combining imdb rating, average box office, and budget-fit (lower fee relative to user_budget raises budget-fit).
-    Return a JSON array (one object per character) with the following structure (minimum fields required; no commentary):
+      - Compute a "score" combining imdb rating, average box office, and budget-fit (lower fee relative to user_budget raises budget-fit). Penalize candidates whose fees push the cumulative total across roles over the provided overall budget (user_budget_inr/user_budget_usd). Enforce global uniqueness: if an actor appears as top for more than one role, keep them only for the role with the best combined score + budget fit, and demote/remove from other roles.
+      - Sort candidates within each role by descending score (tie-break by lower implied_actor_fee_estimate). The first item must be the top candidate, already considering total budget and uniqueness constraints.
+    Return a JSON array (one object per character) with the following structure (minimum fields required; no commentary). Do NOT include a per-role "movies" array — the app provides a single shared movies list from similar_movies_task:
     [
       {
         "role": "Lead Male",
@@ -62,10 +68,9 @@ rank_candidates_task:
           ...
         ],
         "recommended_pool": [ top 6 candidate objects ],
-        "movies": [ ... per-movie metadata ... ]
       },
       ...
     ]
   expected_output: >
-    A JSON array (atleast 2 items) as shown above. Return valid JSON only (no extra commentary).
+    A JSON array (at least 2 items) as shown above. Return valid JSON only (no extra commentary).
   agent: budget_ranker
