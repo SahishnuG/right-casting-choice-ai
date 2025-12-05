@@ -269,8 +269,8 @@ def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[D
         elif isinstance(crew_out.get("movies"), list):
             movies = crew_out.get("movies")
 
-    # tasks outputs (extract from task-level outputs)
-    tasks = crew_out.get("tasks") or []
+    # Extract from final output; also consider per-task outputs if provided under 'tasks_output'
+    tasks = crew_out.get("tasks_output") or []
     if isinstance(tasks, list):
         for t in tasks:
             if not isinstance(t, dict):
@@ -434,27 +434,21 @@ if isinstance(crew_output, dict) and crew_output.get("error"):
 # parse roles & movies
 roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
 
-# detect initial character list from extractor task output, and retry if final roles
-# don't include the same characters (by count or by names)
+# detect initial character list from task outputs if present (tasks_output)
 def detect_characters_from_tasks(out: Dict[str, Any]) -> List[Dict[str, Any]]:
     chars: List[Dict[str, Any]] = []
-    tasks = out.get("tasks") or []
+    tasks = out.get("tasks_output") or []
     if not isinstance(tasks, list):
         return chars
     best_len = 0
     best_list: List[Dict[str, Any]] = []
     for t in tasks:
-        print(t)
         try:
             if not isinstance(t, dict):
                 continue
             text = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
-            if isinstance(text, str):
-                parsed = try_extract_json_from_string(text)
-            else:
-                parsed = text
+            parsed = try_extract_json_from_string(text) if isinstance(text, str) else text
             if isinstance(parsed, list) and parsed:
-                # likely extractor output if objects contain character fields
                 if isinstance(parsed[0], dict) and ("role" in parsed[0] or "name_hint" in parsed[0] or "gender" in parsed[0]):
                     curr = [c for c in parsed if isinstance(c, dict)]
                     if len(curr) > best_len:
@@ -479,7 +473,7 @@ for c in initial_chars:
             expected_names.append(nm)
         initial_by_name[nm] = c
 
-# Do not merge plot-derived hints; use only extractor output
+# Use final crew output + optional tasks_output hints
 
 def _get_role_name(rb: Dict[str, Any]) -> Optional[str]:
     return pick_first(rb, ["name_hint", "nameHint", "role"], None)
@@ -506,7 +500,6 @@ while initial_detected_count and retry_count < max_retries and (
 ):
     retry_count += 1
     augmented_inputs = dict(inputs)
-    # No expected_* hints passed; rely entirely on extractor output
     with st.spinner(f"Retrying to include all {initial_detected_count} characters (attempt {retry_count}/{max_retries})..."):
         crew_output = safe_crew_kickoff(augmented_inputs)
         roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
@@ -907,5 +900,18 @@ st.subheader("Raw Crew Output (parsed)")
 st.json(crew_output)
 if isinstance(crew_output, dict):
     st.caption(f"Top-level keys: {list(crew_output.keys())}")
+
+# Print each task result if tasks_output provided
+tasks_out = crew_output.get("tasks_output") or []
+if isinstance(tasks_out, list) and tasks_out:
+    st.subheader("Task Outputs")
+    for i, t in enumerate(tasks_out, start=1):
+        st.markdown(f"**Task {i}:** {t.get('name') or t.get('id') or ''}")
+        raw_out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
+        if isinstance(raw_out, str):
+            parsed = try_extract_json_from_string(raw_out)
+            st.json(parsed if parsed is not None else raw_out)
+        else:
+            st.json(raw_out)
 
 st.success("Done — candidate pool and similar movies displayed.")

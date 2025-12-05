@@ -74,6 +74,7 @@ def safe_crew_kickoff(inputs: Dict[str, Any], max_retries: int = 1) -> Dict[str,
         for attempt in range(attempts):
             try:
                 result = crew.kickoff(inputs=inputs)
+                tasks_out = result.tasks_output
                 last_error = None
                 break
             except Exception as e:
@@ -104,33 +105,33 @@ def safe_crew_kickoff(inputs: Dict[str, Any], max_retries: int = 1) -> Dict[str,
             try:
                 d = result.to_dict()
                 if isinstance(d, dict) and d:
-                    return d
+                    return d, tasks_out
             except Exception:
                 pass
         if hasattr(result, "raw"):
             raw = result.raw
             if isinstance(raw, dict):
-                return raw
+                return raw, tasks_out
             if isinstance(raw, list):
-                return {"raw": raw}
+                return {"raw": raw}, tasks_out
             if isinstance(raw, str):
                 parsed = try_extract_json_from_string(raw)
-                return {"raw": parsed} if parsed is not None else {"raw": raw}
+                return {"raw": parsed} if parsed is not None else {"raw": raw}, tasks_out
         try:
             d = dict(result)
             if isinstance(d, dict):
-                return d
+                return d, tasks_out
         except Exception:
             pass
         s = str(result)
         parsed = try_extract_json_from_string(s)
         if parsed is not None:
-            return {"raw": parsed}
+            return {"raw": parsed}, tasks_out
         if last_error is not None:
-            return {"error": f"Crew kickoff failed: {last_error}"}
-        return {"raw": str(result)}
+            return {"error": f"Crew kickoff failed: {last_error}"}, None
+        return {"raw": str(result)}, tasks_out
     except Exception as e:
-        return {"error": f"Crew kickoff failed: {e}"}
+        return {"error": f"Crew kickoff failed: {e}"}, None
 
 
 def pick_first(obj: Dict[str, Any], keys: List[str], default=None):
@@ -192,7 +193,7 @@ def normalize_movie_boxoffice(m: Dict[str, Any], usd_to_inr: float) -> Tuple[Opt
     return box, budget
 
 
-def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def extract_roles_and_movies_from_crew(tasks, crew_out: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     roles: List[Dict[str, Any]] = []
     movies: List[Dict[str, Any]] = []
     if not isinstance(crew_out, dict):
@@ -230,36 +231,8 @@ def extract_roles_and_movies_from_crew(crew_out: Dict[str, Any]) -> Tuple[List[D
             roles = [{"role": crew_out.get("role") or "Lead", "candidates": crew_out.get("candidates") or crew_out.get("recommended_pool"), "movies": crew_out.get("movies") or []}]
         elif isinstance(crew_out.get("movies"), list):
             movies = crew_out.get("movies")
-    tasks = crew_out.get("tasks") or []
-    if isinstance(tasks, list):
-        for t in tasks:
-            if not isinstance(t, dict):
-                continue
-            out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
-            if isinstance(out, str):
-                parsed = try_extract_json_from_string(out)
-                if parsed is not None:
-                    out = parsed
-            if isinstance(out, list):
-                if out and isinstance(out[0], dict) and ("role" in out[0] or "candidates" in out[0]):
-                    roles = out
-                if out and isinstance(out[0], dict) and ("imdbID" in out[0] or "Title" in out[0] or "Poster" in out[0]):
-                    movies = out
-            if isinstance(out, dict):
-                if "candidates" in out and isinstance(out["candidates"], list):
-                    roles.append({"role": out.get("role") or out.get("name_hint") or "Lead", "candidates": out["candidates"], "movies": out.get("movies") or []})
-                if "movies" in out and isinstance(out["movies"], list):
-                    movies = out["movies"]
-    # Fallback: if no shared movies collected, aggregate any per-role movies fields
-    if not movies and roles:
-        agg: List[Dict[str, Any]] = []
-        for r in roles:
-            rmov = r.get("movies")
-            if isinstance(rmov, list):
-                for m in rmov:
-                    if isinstance(m, dict):
-                        agg.append(m)
-        movies = agg
+    # Consider per-task outputs if provided under 'tasks_output'
+    movies = try_extract_json_from_string(tasks[1]) 
     return roles, movies
 
 
@@ -366,41 +339,24 @@ inputs = {
 }
 
 with st.spinner("Running crew pipeline..."):
-    crew_output = safe_crew_kickoff(inputs)
+    crew_output, tasks_output = safe_crew_kickoff(inputs)
 
 if isinstance(crew_output, dict) and crew_output.get("error"):
     st.error("Gemini rate limit/quota hit. Please wait and retry.")
     st.caption(str(crew_output.get("error")))
     st.stop()
 
-roles_list, movies_list = extract_roles_and_movies_from_crew(crew_output)
+roles_list, movies_list = extract_roles_and_movies_from_crew(tasks_output, crew_output)
 
 # Detect characters for summary only (no retrying)
 
-def detect_characters_from_tasks(out: Dict[str, Any]) -> List[Dict[str, Any]]:
+def detect_characters_from_tasks(tasks: Dict[str, Any]) -> List[Dict[str, Any]]:
     chars: List[Dict[str, Any]] = []
-    tasks = out.get("tasks") or []
-    if not isinstance(tasks, list):
-        return chars
-    best_len = 0
-    best_list: List[Dict[str, Any]] = []
-    for t in tasks:
-        try:
-            if not isinstance(t, dict):
-                continue
-            text = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
-            parsed = try_extract_json_from_string(text) if isinstance(text, str) else text
-            if isinstance(parsed, list) and parsed:
-                if isinstance(parsed[0], dict) and ("role" in parsed[0] or "name_hint" in parsed[0] or "gender" in parsed[0]):
-                    curr = [c for c in parsed if isinstance(c, dict)]
-                    if len(curr) > best_len:
-                        best_len = len(curr)
-                        best_list = curr
-        except Exception:
-            continue
-    return best_list or chars
+    chars = try_extract_json_from_string(tasks[0])
+    print(chars)
+    return chars
 
-initial_chars = detect_characters_from_tasks(crew_output)
+initial_chars = detect_characters_from_tasks(tasks_output)
 
 # dedupe movies by imdbID
 seen = set()
@@ -638,6 +594,7 @@ with tab_movies:
             if not isinstance(m, dict):
                 continue
             poster = pick_first(m, ["Poster", "poster", "poster_url", "PosterUrl"]) or pick_first(m.get("_raw") or {}, ["Poster", "poster"])
+            print("Poster URL:", poster)
             title = pick_first(m, ["Title", "title", "name"]) or ""
             year = pick_first(m, ["Year", "year"]) or ""
             imdb = pick_first(m, ["imdbRating", "imdb_rating", "imdb"]) or ""
@@ -661,42 +618,22 @@ with tab_movies:
             cols = st.columns(min(len(posters), n_similar))
             for i, p in enumerate(posters[:n_similar]):
                 with cols[i]:
-                    st.image(p["poster"], use_column_width=True)
+                    st.image(p["poster"], use_container_width=True)
                     st.caption(p["title"])
         try:
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
         except Exception:
             st.write(rows)
 
-st.subheader("Raw Crew Output (parsed)")
-st.json(crew_output)
-if isinstance(crew_output, dict):
-    st.caption(f"Top-level keys: {list(crew_output.keys())}")
-
-# Explicitly show the output of similar_movies_task for debugging/visibility
-tasks = crew_output.get("tasks") or []
-similar_movies_payload = None
-try:
-    for t in tasks:
-        if not isinstance(t, dict):
-            continue
-        t_name = (t.get("name") or t.get("id") or "").lower()
-        t_desc = str(t.get("description") or "").lower()
-        if ("similar_movies_task" in t_name) or ("similar movies" in t_desc):
-            raw_out = t.get("output") or t.get("result") or t.get("raw_output") or t.get("raw")
-            if isinstance(raw_out, str):
-                parsed = try_extract_json_from_string(raw_out)
-                similar_movies_payload = parsed if parsed is not None else raw_out
-            else:
-                similar_movies_payload = raw_out
-            break
-except Exception:
-    similar_movies_payload = None
-
-st.subheader("similar_movies_task — Raw Output")
-if similar_movies_payload is not None:
-    st.json(similar_movies_payload)
-else:
-    st.info("No explicit output found for similar_movies_task in crew_output['tasks'].")
+# Print each task result if tasks_output present
+if isinstance(tasks_output, list) and tasks_output:
+    st.subheader("Task Outputs")
+    for i, t in enumerate(tasks_output, start=1):
+        st.markdown(f"**Task {i}:**")
+        if isinstance(t, str):
+            parsed = try_extract_json_from_string(t)
+            st.json(parsed if parsed is not None else t)
+        else:
+            st.json(t)
 
 st.success("Done — candidate pool and similar movies displayed.")
