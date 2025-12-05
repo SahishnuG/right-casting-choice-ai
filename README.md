@@ -9,18 +9,12 @@ An AI assistant that proposes casting choices for a film plot. It extracts chara
 - Optional per‑task visibility: prints each task’s output when available (`tasks_output`).
 
 ## Demo
-<video src="./demo.mp4" controls width="720" muted playsinline>
-  Sorry, your browser doesn't support embedded videos.
-  You can download and watch the demo here: <a href="./demo.mp4">demo.mp4</a>.
-</video>
-
-If GitHub doesn't render the video inline, use this direct link: [demo.mp4](./demo.mp4)
+[![Demo GIF](./demo.gif)](./demo.mp4)
 
 ## Repository Structure
 ```
 right-casting-choice-ai/
-├─ app.py                 # Streamlit app (retry/enrichment + fallbacks)
-├─ app1.py                # Streamlit app (clean parsing + stricter fee trust)
+├─ app1.py                # Streamlit app UI
 ├─ main.py                # CLI runner: run / train / replay / test
 ├─ Dockerfile             # Production container (serves app1.py on port 8000)
 ├─ pyproject.toml         # Package metadata
@@ -61,14 +55,7 @@ python -m pip install -r .\requirements.txt
 ```
 
 ## Run the Streamlit App
-You can run either UI. Both accept the same inputs; they differ in fallback behavior and how they treat fee sources.
-
-- `app.py` (more resilient; retries/enrichment + derived candidates when missing):
-```powershell
-streamlit run .\app.py
-```
-
-- `app1.py` (cleaner parsing; stricter “low‑trust” fee handling; optional match score column):
+Run the UI:
 ```powershell
 streamlit run .\app1.py
 ```
@@ -129,17 +116,7 @@ Open http://localhost:8000 in your browser.
   - Budget summary with industry‑aware units (Cr for Bollywood, M for Hollywood).
   - Task outputs (if the crew SDK exposes them as `result.tasks_output`): serialized and printed in “Task Outputs”.
 
-## `app.py` vs `app1.py`
-- `app.py`
-  - Attempts enrichment if fewer characters appear in the final roles than detected.
-  - Derives candidate names from similar movies when the crew returns none; can also query via Serper.
-  - Displays warnings when returned roles < detected characters.
-- `app1.py`
-  - Cleaner parsing path and centralized box office normalization.
-  - Stricter low‑trust fee handling (flags net‑worth/vague sources and ignores those fees for selection).
-  - Adds optional `Match Score` column for similar movies when present.
-
-Both apps prevent selecting the same actor for multiple roles and compute a grand total of the top pick per role.
+The app prevents selecting the same actor for multiple roles and computes a grand total of the top pick per role.
 
 ## Configuration
 - Industry selection influences candidate pools and currency units:
@@ -150,7 +127,7 @@ Both apps prevent selecting the same actor for multiple roles and compute a gran
 
 ## Troubleshooting
 - Rate limits/quota: UI shows a friendly error and stops; try again later. The code also respects retry hints when present.
-- Empty candidates: Try `app.py` which synthesizes fallback candidates from movie `Actors` lists.
+- Empty candidates: Candidate availability depends on the crew output and available movie data.
 - Missing posters: OMDb sometimes returns `N/A`; the UI skips those.
 - Fees not showing: Ensure the ranker returns `implied_actor_fee_estimate` as a numeric INR integer and that sources are not low‑trust (ignored by `app1.py`).
 
