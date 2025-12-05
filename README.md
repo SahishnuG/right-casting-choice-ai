@@ -137,4 +137,4 @@ The app prevents selecting the same actor for multiple roles and computes a gran
 - Extend tools in `src/right_casting_choice_ai/tools/` for additional data sources.
 
 ## License
-This project is for educational and experimental use. Replace with your desired license.
+Licensed under the MIT License. See [`LICENSE`](./LICENSE) for details.
