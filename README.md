@@ -1,147 +1,163 @@
 # Right Casting Choice AI
 
-Right Casting Choice AI is a three-agent casting workflow built on [crewAI](https://crewai.com). It analyzes a movie plot, finds similar films, enriches them with OMDb data, and ranks actors against budget constraints — producing candidate lists per role.
+An AI assistant that proposes casting choices for a film plot. It extracts character profiles, finds thematically similar movies, assembles actor candidates, estimates per‑film fees, and checks the total against a user budget. Built with CrewAI agents and a Streamlit UI.
 
-Key features:
-- Character extraction via Gemini (JSON-only output)
-- Similar movies found with Serper and enriched with OMDb (converted to INR)
-- Budget-aware actor ranking and per-role suggestions
-- Industry selection (Hollywood or Bollywood) with Bollywood-specific filtering
+## Highlights
+- CrewAI workflow with 3 agents: character extractor, similar‑movies + OMDb aggregator, and budget‑aware ranker.
+- Streamlit apps: interactive candidate tables, posters, and budget summaries.
+- Robust JSON parsing and currency handling (USD→INR conversion for box office and fees).
+- Optional per‑task visibility: prints each task’s output when available (`tasks_output`).
 
-This project uses Gemini exclusively; there are no OpenAI calls. Environment variables are read from `.env`.
+## Demo
+<video src="./demo.mp4" controls width="720" muted playsinline>
+  Sorry, your browser doesn't support embedded videos.
+  You can download and watch the demo here: <a href="./demo.mp4">demo.mp4</a>.
+</video>
 
----
+If GitHub doesn't render the video inline, use this direct link: [demo.mp4](./demo.mp4)
 
-## Quick Start
-
-Requirements:
-- Python `>=3.10,<3.14`
-
-Install dependencies:
-```powershell
-pip install -e .
+## Repository Structure
+```
+right-casting-choice-ai/
+├─ app.py                 # Streamlit app (retry/enrichment + fallbacks)
+├─ app1.py                # Streamlit app (clean parsing + stricter fee trust)
+├─ main.py                # CLI runner: run / train / replay / test
+├─ Dockerfile             # Production container (serves app1.py on port 8000)
+├─ pyproject.toml         # Package metadata
+├─ requirements.txt       # Python dependencies
+└─ src/right_casting_choice_ai/
+   ├─ crew.py             # Crew definition (agents + tasks + crew)
+   ├─ config/
+   │  ├─ agents.yaml      # Agent prompts + behaviors
+   │  └─ tasks.yaml       # Task descriptions + expected outputs
+   └─ tools/
+      ├─ omdb.py          # OMDb tool: normalizes data + converts to INR
+      └─ custom_tool.py   # Example tool template
 ```
 
-Create a `.env` file in the project root:
-```env
-# Gemini
-GEMINI_API_KEY=your_gemini_key   # or use GOOGLE_API_KEY
+## Prerequisites
+- Python 3.10–3.13
+- API keys:
+  - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for Gemini
+  - `OMDB_API_KEY` for OMDb (movie metadata)
+  - `SERPER_API_KEY` (or `SERPERDEV_API_KEY`) for Serper search
 
-# Serper
-SERPER_API_KEY=your_serper_key   # or SERPERDEV_API_KEY
+Optional:
+- `USD_TO_INR_RATE` to override default 83.0 for conversions.
 
-# OMDb
+Example `.env`:
+```
+GEMINI_API_KEY=your_gemini_key
 OMDB_API_KEY=your_omdb_key
-
-# Optional
+SERPER_API_KEY=your_serper_key
 USD_TO_INR_RATE=83.0
 ```
 
-Run the Streamlit app:
+## Setup (Windows PowerShell)
 ```powershell
-streamlit run app.py
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r .\requirements.txt
 ```
-In the UI:
-- Enter the plot
-- Choose `Industry` (Hollywood or Bollywood)
-- Set `n_similar`, budget (crores for Bollywood or USD for Hollywood), and USD→INR rate
 
-Run the CLI sample:
+## Run the Streamlit App
+You can run either UI. Both accept the same inputs; they differ in fallback behavior and how they treat fee sources.
+
+- `app.py` (more resilient; retries/enrichment + derived candidates when missing):
 ```powershell
-python main.py
+streamlit run .\app.py
 ```
-It prints summary counts, per-role suggestions, and a normalized JSON result.
 
----
+- `app1.py` (cleaner parsing; stricter “low‑trust” fee handling; optional match score column):
+```powershell
+streamlit run .\app1.py
+```
+
+During a run, the app:
+- Extracts characters from your plot
+- Finds similar movies and shows posters
+- Builds an audition list with actor statistics and estimated fees
+- Selects a top candidate per role and totals the cost against your budget
+- Prints each task’s output if available (see “Task Outputs” section in the UI)
+
+## CLI Usage
+`main.py` provides a simple CLI for running or experimenting with the crew without the UI.
+
+```powershell
+# Run once with sample inputs, print summary + JSON
+python .\main.py run
+
+# Train the crew (toy training interface)
+python .\main.py train 5 models/crew_state.json
+
+# Replay a specific task by id
+python .\main.py replay <task_id>
+
+# Test with evaluator LLM id
+python .\main.py test 3 gemini/gemini-2.5-flash
+```
+
+## Docker
+The provided Dockerfile serves `app1.py` on port 8000.
+
+```powershell
+# Build
+docker build -t right-casting-choice-ai .
+
+# Run (Windows PowerShell)
+docker run --rm -it -p 8000:8000 `
+  -e GEMINI_API_KEY=$Env:GEMINI_API_KEY `
+  -e OMDB_API_KEY=$Env:OMDB_API_KEY `
+  -e SERPER_API_KEY=$Env:SERPER_API_KEY `
+  right-casting-choice-ai
+```
+Open http://localhost:8000 in your browser.
 
 ## How It Works
+- Crew: defined in `src/right_casting_choice_ai/crew.py`.
+  - Agents: `character_extractor`, `similar_movies_and_omdb`, `budget_ranker`.
+  - Tasks: `extract_characters_task`, `similar_movies_task`, `rank_candidates_task` configured via YAML.
+  - Process: sequential (extract → movies → rank).
+- Tools:
+  - `omdb.py`: fetches OMDb details, normalizes poster/box office/budget/IMDB, converts USD→INR.
+  - Serper (via `crewai_tools.SerperDevTool`): finds titles and salary/fee references.
+- Streamlit apps:
+  - Robust JSON scrapers for LLM outputs (code‑fenced/inline).
+  - Currency parsing and conversions.
+  - Poster grid + movie table (Title, Year, IMDB, BoxOffice; `app1.py` also shows optional Match Score).
+  - Candidate tables with IMDB, average box office, fee, and notes.
+  - Budget summary with industry‑aware units (Cr for Bollywood, M for Hollywood).
+  - Task outputs (if the crew SDK exposes them as `result.tasks_output`): serialized and printed in “Task Outputs”.
 
-Pipeline (sequential crew):
-1. Character Extractor (`character_extractor`)
-	 - LLM: `gemini/gemini-2.5-flash`
-	 - Task: `extract_characters_task`
-	 - Output: JSON array of 2–6 character profiles with: `role`, `name_hint`, `age_range`, `traits`, `gender`
-
-2. Similar Movies + OMDb (`similar_movies_and_omdb`)
-	 - Tooling: `SerperDevTool`, custom `OmdbTool`
-	 - Task: `similar_movies_task`
-	 - Output per movie: `{Title, Year, Actors, Poster, BoxOfficeINR, BudgetINR, imdbRating, imdbID, _raw}`
-	 - Bollywood filter (UI): keeps movies whose OMDb `_raw.Language` contains “Hindi” or `_raw.Country` contains “India”
-
-3. Budget Ranker (`budget_ranker`)
-	 - Task: `rank_candidates_task`
-	 - Expected output (tasks.yaml): per-role objects like:
-		 ```json
-		 [
-			 {"candidates": [...], "role": "Lead Male", "name_hint": "Arjun", "movies": [...]},
-			 {"candidates": [...], "role": "Lead Female", "name_hint": "Meera", "movies": [...]}
-		 ]
-		 ```
-	 - The app also builds per-role suggestions by pairing the top-ranked actors with extracted roles if the task returns a flat candidate list.
-
-Data flow:
-- `app.py` orchestrates the crew run, normalizes the `CrewOutput`, and displays:
-	- Candidate pool (actors table)
-	- Suggested actors per role
-	- Similar movies & posters
-	- Raw parsed JSON (with top-level keys to aid debugging)
-
----
-
-## Configuration & Code Layout
-
-- `src/right_casting_choice_ai/crew.py`
-	- Declares the three agents and tasks
-	- Attaches Serper + OMDb tools to the second agent
-	- Uses `gemini/gemini-2.5-flash` for all agents
-
-- `src/right_casting_choice_ai/config/agents.yaml`
-	- Agent roles, goals, backstories
-	- LLM model string: `gemini/gemini-2.5-flash`
-
-- `src/right_casting_choice_ai/config/tasks.yaml`
-	- Task descriptions & expected outputs
-	- Includes `industry` and `usd_to_inr` in prompts to guide tool usage
-
-- `src/right_casting_choice_ai/tools/omdb.py`
-	- `OmdbTool` (CrewAI BaseTool)
-	- Queries OMDb and returns a JSON string with normalized fields
-	- Parses USD BoxOffice/Budget and converts to INR (`USD_TO_INR_RATE`)
-
+## `app.py` vs `app1.py`
 - `app.py`
-	- Streamlit UI with two tabs: “Candidate Pool” and “Similar Movies & Posters”
-	- Normalizes `CrewOutput` across versions (`to_dict`, `raw`, `results`, `tasks_output`)
-	- Industry dropdown applies Bollywood filtering before poster rendering
+  - Attempts enrichment if fewer characters appear in the final roles than detected.
+  - Derives candidate names from similar movies when the crew returns none; can also query via Serper.
+  - Displays warnings when returned roles < detected characters.
+- `app1.py`
+  - Cleaner parsing path and centralized box office normalization.
+  - Stricter low‑trust fee handling (flags net‑worth/vague sources and ignores those fees for selection).
+  - Adds optional `Match Score` column for similar movies when present.
 
-- `main.py`
-	- CLI runner: performs a crew run and prints summary + normalized JSON
-	- Includes per-role suggestions built from top-ranked actors
+Both apps prevent selecting the same actor for multiple roles and compute a grand total of the top pick per role.
 
----
-
-## Environment Variables & Mapping
-
-- Gemini: the app sets `GEMINI_API_KEY`; if only `GOOGLE_API_KEY` is present, it maps to `GEMINI_API_KEY` as well
-- Serper: supports `SERPER_API_KEY` and `SERPERDEV_API_KEY`
-- OMDb: `OMDB_API_KEY`
-- Optional: `USD_TO_INR_RATE`
-
-The Streamlit app loads `.env` at startup and standardizes these env vars for the SDK/tools.
-
----
+## Configuration
+- Industry selection influences candidate pools and currency units:
+  - Bollywood → INR display in Crores (Cr), bias Indian/Hindi titles/actors
+  - Hollywood → USD display in Millions (M), bias English titles/actors
+- Exchange rate: configurable via UI and `USD_TO_INR_RATE`.
+- Budget input: in M (Hollywood) or Cr (Bollywood), internally converted to raw integer units.
 
 ## Troubleshooting
+- Rate limits/quota: UI shows a friendly error and stops; try again later. The code also respects retry hints when present.
+- Empty candidates: Try `app.py` which synthesizes fallback candidates from movie `Actors` lists.
+- Missing posters: OMDb sometimes returns `N/A`; the UI skips those.
+- Fees not showing: Ensure the ranker returns `implied_actor_fee_estimate` as a numeric INR integer and that sources are not low‑trust (ignored by `app1.py`).
 
-- Gemini INVALID_ARGUMENT / auth errors:
-	- Ensure `.env` keys exist and are loaded
-	- Use `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+## Development Notes
+- The apps expect the crew to return a final JSON‑like result. When available, each `TaskOutput` is serialized and shown under “Task Outputs”.
+- Update prompts in `src/right_casting_choice_ai/config/*.yaml` to tune behavior.
+- Extend tools in `src/right_casting_choice_ai/tools/` for additional data sources.
 
-- Empty crew output in UI:
-	- The app normalizes output via several strategies; check the “Top-level keys” caption
-	- Verify API keys and internet access; rerun
-
-- Missing posters or sparse movies:
-	- Confirm OMDb responses include `Poster` URLs and valid `imdbID`
-	- Increase `n_similar` or adjust plot wording
-
----
+## License
+This project is for educational and experimental use. Replace with your desired license.
